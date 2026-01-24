@@ -57,11 +57,11 @@ While traditional algorithms focus on price (Technical Analysis), this system qu
 > ⚠️ **Disclaimer:** This is a portfolio project for educational purposes. It is NOT a trading system and does NOT provide investment advice. The system detects potential divergences for analysis — it does not predict market movements.
 
 ### 🏗 Architecture flow
-```mermaid
+```
 graph LR
     A[🕒 Daily Trigger] -->|Orchestrator| B(🐍 Python / Azure Function)
     B -->|REST API| C[📰 News Aggregators & Market Data]
-    B -->|Context & Scoring| D{🧠 Gemini AI (Master Prompt)}
+    B -->|Context & Scoring| D{"🧠 Gemini AI (Master Prompt)"}
     D -->|Structured Signals| E[(🗄️ Azure SQL Database)]
     E -->|Business Intelligence| F[📊 Power BI Dashboard]
 
