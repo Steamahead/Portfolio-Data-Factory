@@ -20,6 +20,10 @@ It serves as a serverless "laboratory" utilizing a modern tech stack (Cloud, AI,
 ![Power BI](https://img.shields.io/badge/Power%20BI-Analytics-F2C811?style=for-the-badge&logo=powerbi&logoColor=black)
 ![Git](https://img.shields.io/badge/Git-Version%20Control-F05032?style=for-the-badge&logo=git&logoColor=white)
 
+
+<img width="2816" height="1536" alt="Gemini_Generated_Image_nlnyxlnlnyxlnlny" src="https://github.com/user-attachments/assets/8e3fa25e-cf7f-4a5e-b9b0-6203f91107dd" />
+
+
 ### Deep Dive Description
 
 The **Shiller Hybrid Index** is an automated sentiment analysis system that addresses the problem of "Information Overload" in financial markets.
