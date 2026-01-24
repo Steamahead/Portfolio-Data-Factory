@@ -21,7 +21,8 @@ It serves as a serverless "laboratory" utilizing a modern tech stack (Cloud, AI,
 ![Git](https://img.shields.io/badge/Git-Version%20Control-F05032?style=for-the-badge&logo=git&logoColor=white)
 
 
-<img width="2816" height="1536" alt="Gemini_Generated_Image_nlnyxlnlnyxlnlny" src="https://github.com/user-attachments/assets/8e3fa25e-cf7f-4a5e-b9b0-6203f91107dd" />
+<img width="2816" height="1536" alt="Gemini_Generated_Image_pwcdiepwcdiepwcd" src="https://github.com/user-attachments/assets/62e49502-3416-49f5-b416-03a8cd94102a" />
+
 
 
 ### Deep Dive Description
