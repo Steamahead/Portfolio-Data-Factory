@@ -1,0 +1,26 @@
+# --- BEZPIECZEŃSTWO (Klucze i Hasła) ---
+local.settings.json
+*.json
+!host.json
+!proxies.json
+
+# --- ŚRODOWISKO PYTHON ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# --- PLIKI TYMCZASOWE I LOGI ---
+*.log
+*.csv
+*.xlsx
+
+# --- IDE (PyCharm / VS Code) ---
+.idea/
+.vscode/
+*.swp
+
+# --- AZURE FUNCTIONS ---
+bin/
+obj/
+appsettings.json
