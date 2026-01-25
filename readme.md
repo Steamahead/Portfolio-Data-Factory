@@ -61,7 +61,7 @@ While traditional algorithms focus on price (Technical Analysis), this system qu
 
 > ⚠️ **Disclaimer:** This is a portfolio project for educational purposes. It is NOT a trading system and does NOT provide investment advice. The system detects potential divergences for analysis — it does not predict market movements.
 
-### 🏗 Architecture flow
+### Architecture flow
 ```
 graph LR
     A[🕒 Daily Trigger] -->|Orchestrator| B(🐍 Python / Azure Function)
