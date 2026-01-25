@@ -231,7 +231,7 @@ Return ONLY valid JSON. No markdown code blocks.
   "articles": [
     {{
       "article_num": 1,
-      "headline_preview": "<first 60 characters>",
+      "headline_preview": "<first 250 characters>",
       "filter": {{
         "is_about_company": "PRIMARY|MENTIONED|NO",
         "sentiment_usable": "YES|PARTIAL|NO",
@@ -416,11 +416,16 @@ def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, pri
 
 # --- 4. DATABASE FUNCTION ---
 
-def save_to_sql_database(final_data: dict):
-    if not final_data: return
+def save_to_sql_database(final_data: dict) -> bool:
+    """Save analysis results to SQL database. Returns True on success, False on failure."""
+    if not final_data:
+        return False
     conn_str = os.environ.get("SqlConnectionString")
-    if not conn_str: return
+    if not conn_str:
+        logger.error("❌ SqlConnectionString not configured")
+        return False
 
+    conn = None
     try:
         conn = pyodbc.connect(conn_str)
         cursor = conn.cursor()
@@ -458,7 +463,7 @@ def save_to_sql_database(final_data: dict):
         cursor.execute("DELETE FROM Shiller.Articles WHERE date = ? AND ticker = ?", meta["analysis_date"], meta["ticker"])
 
         sql_art = """
-            INSERT INTO Shiller.Articles 
+            INSERT INTO Shiller.Articles
             (date, ticker, article_num, headline_preview, is_about_company, sentiment_usable, hype_usable, excluded, exclusion_reason,
              centrality, credibility_sentiment, credibility_hype, recency, materiality, speculation_signal,
              quality_sentiment, quality_hype, sentiment_raw, hype_raw, reasoning)
@@ -485,10 +490,23 @@ def save_to_sql_database(final_data: dict):
 
         conn.commit()
         logger.info(f"✅ Data saved for {meta['ticker']}")
-        conn.close()
+        return True
 
     except Exception as e:
-        logger.error(f"❌ Database Error: {e}")
+        logger.error(f"❌ Database Error for {final_data.get('metadata', {}).get('ticker', 'unknown')}: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return False
+
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # --- 5. DATA FETCHING FUNCTIONS ---
@@ -585,42 +603,60 @@ def fetch_news(ticker: str, trading_date) -> list[str]:
 def run_shiller_analysis() -> list[dict]:
     """Run the full Shiller Hybrid Index analysis for all tickers."""
     results = []
+    failed_tickers = []
 
     for ticker in TICKERS:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"ANALYZING: {ticker}")
-        logger.info(f"{'='*60}")
+        try:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"ANALYZING: {ticker}")
+            logger.info(f"{'='*60}")
 
-        # 1. Fetch price data
-        price_data = fetch_price_data(ticker)
-        if price_data is None:
+            # 1. Fetch price data
+            price_data = fetch_price_data(ticker)
+            if price_data is None:
+                logger.warning(f"⚠️ Skipping {ticker}: Could not fetch price data")
+                failed_tickers.append((ticker, "price_data_fetch_failed"))
+                continue
+
+            logger.info(f"Price: ${price_data['current_price']} | MA30: ${price_data['ma_30']} | Gap: {price_data['gap_percent']}%")
+
+            # 2. Fetch news
+            headlines = fetch_news(ticker, price_data["trading_date"])
+            valid_count = len([h for h in headlines if h != "N/A"])
+            logger.info(f"Fetched {valid_count} valid headlines")
+
+            # 3. Run LLM analysis
+            company_name = TICKER_NEWS_CONFIG.get(ticker, {}).get("company_name", ticker)
+
+            logger.info("Sending to Gemini for detailed analysis...")
+            analysis_result = analyze_hype_score(headlines, ticker, company_name, price_data)
+
+            if analysis_result:
+                agg = analysis_result["aggregated_scores"]
+                logger.info(f"✅ {ticker}: Sentiment={agg['final_sentiment']} ({agg['sentiment_confidence']}), Hype={agg['final_hype']} ({agg['hype_confidence']})")
+
+                # Store original headlines for CSV export
+                analysis_result["original_headlines"] = headlines
+
+                # Save to database (commits immediately for this ticker)
+                if save_to_sql_database(analysis_result):
+                    results.append(analysis_result)
+                else:
+                    failed_tickers.append((ticker, "database_save_failed"))
+            else:
+                logger.error(f"❌ Analysis failed for {ticker}")
+                failed_tickers.append((ticker, "llm_analysis_failed"))
+
+        except Exception as e:
+            logger.error(f"❌ Unexpected error processing {ticker}: {e}")
+            failed_tickers.append((ticker, str(e)))
+            # Continue to next ticker instead of crashing the entire pipeline
             continue
 
-        logger.info(f"Price: ${price_data['current_price']} | MA30: ${price_data['ma_30']} | Gap: {price_data['gap_percent']}%")
-
-        # 2. Fetch news
-        headlines = fetch_news(ticker, price_data["trading_date"])
-        valid_count = len([h for h in headlines if h != "N/A"])
-        logger.info(f"Fetched {valid_count} valid headlines")
-
-        # 3. Run LLM analysis
-        company_name = TICKER_NEWS_CONFIG.get(ticker, {}).get("company_name", ticker)
-
-        logger.info("Sending to Gemini for detailed analysis...")
-        analysis_result = analyze_hype_score(headlines, ticker, company_name, price_data)
-
-        if analysis_result:
-            agg = analysis_result["aggregated_scores"]
-            logger.info(f"✅ {ticker}: Sentiment={agg['final_sentiment']} ({agg['sentiment_confidence']}), Hype={agg['final_hype']} ({agg['hype_confidence']})")
-
-            # Store original headlines for CSV export
-            analysis_result["original_headlines"] = headlines
-
-            # Save to database
-            save_to_sql_database(analysis_result)
-            results.append(analysis_result)
-        else:
-            logger.error(f"❌ Analysis failed for {ticker}")
+    # Summary log
+    if failed_tickers:
+        logger.warning(f"⚠️ Failed tickers: {failed_tickers}")
+    logger.info(f"✅ Successfully processed {len(results)}/{len(TICKERS)} tickers")
 
     return results
 
