@@ -44,9 +44,8 @@ def load_local_settings():
                 logger.info(f"Loaded settings from {settings_path}")
                 return True
             except Exception as e:
-                wait_time = (attempt + 1) * 5  # ZMIANA: Czekaj 5s, 10s, 15s
-                logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
-                time.sleep(wait_time)
+                logger.warning(f"Failed to load {settings_path}: {e}")
+                continue
 
     logger.warning("local.settings.json not found, using existing environment variables.")
     return False
@@ -416,21 +415,19 @@ def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, pri
 
 # --- 4. DATABASE FUNCTION ---
 
-def save_to_sql_database(final_data: dict) -> bool:
-    """Save analysis results to SQL database. Returns True on success, False on failure."""
-    if not final_data:
-        return False
-    conn_str = os.environ.get("SqlConnectionString")
-    if not conn_str:
-        logger.error("❌ SqlConnectionString not configured")
-        return False
+# Retry configuration (tuned for Azure SQL Serverless cold starts which can take 30-60s)
+DB_MAX_RETRIES = 4
+DB_RETRY_BASE_DELAY = 10  # seconds -> delays: 10s, 20s, 30s (total ~60s coverage)
 
+
+def _execute_database_save(final_data: dict, conn_str: str) -> bool:
+    """Execute the actual database save operation. Returns True on success."""
     conn = None
     try:
-        conn = pyodbc.connect(conn_str)
+        # Add connection timeout to prevent long hangs
+        conn = pyodbc.connect(conn_str, timeout=30)
         cursor = conn.cursor()
 
-        # 1. Insert into DailyScores
         meta = final_data["metadata"]
         scores = final_data["aggregated_scores"]
 
@@ -445,21 +442,18 @@ def save_to_sql_database(final_data: dict) -> bool:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
 
-        # Zabezpieczenie przed None (SQL nie lubi None w float)
         sent_val = float(scores["final_sentiment"]) if scores["final_sentiment"] is not None else 0.0
         hype_val = float(scores["final_hype"]) if scores["final_hype"] is not None else 0.0
 
         params_daily = (
             meta["analysis_date"], meta["ticker"],
-            sent_val, hype_val, scores["sentiment_confidence"], scores["hype_confidence"], # UPDATE params
-            meta["analysis_date"], meta["ticker"], float(meta["price"]), float(meta["ma_30"]), float(meta["gap_pct"]), # INSERT params
+            sent_val, hype_val, scores["sentiment_confidence"], scores["hype_confidence"],
+            meta["analysis_date"], meta["ticker"], float(meta["price"]), float(meta["ma_30"]), float(meta["gap_pct"]),
             sent_val, hype_val, scores["sentiment_confidence"], scores["hype_confidence"],
             meta["articles_received"], scores["articles_used_sentiment"], scores["articles_used_hype"]
         )
         cursor.execute(sql_daily, params_daily)
 
-        # 2. Insert Articles
-        # Najpierw usuwamy stare dla tej daty/tickera (żeby nie dublować przy ponownym uruchomieniu)
         cursor.execute("DELETE FROM Shiller.Articles WHERE date = ? AND ticker = ?", meta["analysis_date"], meta["ticker"])
 
         sql_art = """
@@ -471,7 +465,6 @@ def save_to_sql_database(final_data: dict) -> bool:
         """
 
         for art in final_data["articles"]:
-            # Wyliczamy quality w Pythonie, żeby zapisać do bazy
             qual = calculate_quality_scores(art)
             qm = art.get("quality_metrics") or {}
             sc = art.get("scores") or {}
@@ -489,17 +482,7 @@ def save_to_sql_database(final_data: dict) -> bool:
             cursor.execute(sql_art, params_art)
 
         conn.commit()
-        logger.info(f"✅ Data saved for {meta['ticker']}")
         return True
-
-    except Exception as e:
-        logger.error(f"❌ Database Error for {final_data.get('metadata', {}).get('ticker', 'unknown')}: {e}")
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        return False
 
     finally:
         if conn:
@@ -507,6 +490,39 @@ def save_to_sql_database(final_data: dict) -> bool:
                 conn.close()
             except Exception:
                 pass
+
+
+def save_to_sql_database(final_data: dict) -> bool:
+    """Save analysis results to SQL database with retry logic. Returns True on success, False on failure."""
+    if not final_data:
+        return False
+
+    conn_str = os.environ.get("SqlConnectionString")
+    if not conn_str:
+        logger.error("❌ SqlConnectionString not configured")
+        return False
+
+    ticker = final_data.get("metadata", {}).get("ticker", "unknown")
+    last_error = None
+
+    for attempt in range(DB_MAX_RETRIES):
+        try:
+            if _execute_database_save(final_data, conn_str):
+                if attempt > 0:
+                    logger.info(f"✅ Data saved for {ticker} (succeeded on attempt {attempt + 1})")
+                else:
+                    logger.info(f"✅ Data saved for {ticker}")
+                return True
+        except Exception as e:
+            last_error = e
+            if attempt < DB_MAX_RETRIES - 1:
+                wait_time = DB_RETRY_BASE_DELAY * (attempt + 1)  # 10s, 20s, 30s
+                logger.warning(f"⚠️ Database save attempt {attempt + 1}/{DB_MAX_RETRIES} failed for {ticker}: {e}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"❌ Database save failed for {ticker} after {DB_MAX_RETRIES} attempts: {e}")
+
+    return False
 
 
 # --- 5. DATA FETCHING FUNCTIONS ---
@@ -600,64 +616,120 @@ def fetch_news(ticker: str, trading_date) -> list[str]:
 
 # --- 6. MAIN ORCHESTRATION ---
 
+# Orchestration retry configuration
+ORCHESTRATION_MAX_RETRIES = 2  # Retry failed tickers up to 2 more times
+
+
+def _process_single_ticker(ticker: str) -> tuple[dict | None, str | None]:
+    """
+    Process a single ticker through the full pipeline.
+    Returns (analysis_result, error_type) where error_type is None on success.
+    """
+    try:
+        logger.info(f"{'='*60}")
+        logger.info(f"ANALYZING: {ticker}")
+        logger.info(f"{'='*60}")
+
+        # 1. Fetch price data
+        price_data = fetch_price_data(ticker)
+        if price_data is None:
+            logger.warning(f"⚠️ Skipping {ticker}: Could not fetch price data")
+            return None, "price_data_fetch_failed"
+
+        logger.info(f"Price: ${price_data['current_price']} | MA30: ${price_data['ma_30']} | Gap: {price_data['gap_percent']}%")
+
+        # 2. Fetch news
+        headlines = fetch_news(ticker, price_data["trading_date"])
+        valid_count = len([h for h in headlines if h != "N/A"])
+        logger.info(f"Fetched {valid_count} valid headlines")
+
+        # 3. Run LLM analysis
+        company_name = TICKER_NEWS_CONFIG.get(ticker, {}).get("company_name", ticker)
+
+        logger.info("Sending to Gemini for detailed analysis...")
+        analysis_result = analyze_hype_score(headlines, ticker, company_name, price_data)
+
+        if not analysis_result:
+            logger.error(f"❌ Analysis failed for {ticker}")
+            return None, "llm_analysis_failed"
+
+        agg = analysis_result["aggregated_scores"]
+        logger.info(f"✅ {ticker}: Sentiment={agg['final_sentiment']} ({agg['sentiment_confidence']}), Hype={agg['final_hype']} ({agg['hype_confidence']})")
+
+        # Store original headlines for CSV export
+        analysis_result["original_headlines"] = headlines
+
+        # 4. Save to database (has its own retry logic)
+        if save_to_sql_database(analysis_result):
+            return analysis_result, None
+        else:
+            # Return the analysis result so we can retry just the DB save later
+            return analysis_result, "database_save_failed"
+
+    except Exception as e:
+        logger.error(f"❌ Unexpected error processing {ticker}: {e}")
+        return None, str(e)
+
+
 def run_shiller_analysis() -> list[dict]:
-    """Run the full Shiller Hybrid Index analysis for all tickers."""
+    """Run the full Shiller Hybrid Index analysis for all tickers with retry logic."""
     results = []
-    failed_tickers = []
+    # Track failures with their analysis results (for DB-only retries)
+    failed_tickers: list[tuple[str, str, dict | None]] = []  # (ticker, error_type, analysis_result)
 
+    # First pass: process all tickers
     for ticker in TICKERS:
-        try:
-            logger.info(f"\n{'='*60}")
-            logger.info(f"ANALYZING: {ticker}")
-            logger.info(f"{'='*60}")
+        analysis_result, error_type = _process_single_ticker(ticker)
+        if error_type is None:
+            results.append(analysis_result)
+        else:
+            failed_tickers.append((ticker, error_type, analysis_result))
 
-            # 1. Fetch price data
-            price_data = fetch_price_data(ticker)
-            if price_data is None:
-                logger.warning(f"⚠️ Skipping {ticker}: Could not fetch price data")
-                failed_tickers.append((ticker, "price_data_fetch_failed"))
-                continue
-
-            logger.info(f"Price: ${price_data['current_price']} | MA30: ${price_data['ma_30']} | Gap: {price_data['gap_percent']}%")
-
-            # 2. Fetch news
-            headlines = fetch_news(ticker, price_data["trading_date"])
-            valid_count = len([h for h in headlines if h != "N/A"])
-            logger.info(f"Fetched {valid_count} valid headlines")
-
-            # 3. Run LLM analysis
-            company_name = TICKER_NEWS_CONFIG.get(ticker, {}).get("company_name", ticker)
-
-            logger.info("Sending to Gemini for detailed analysis...")
-            analysis_result = analyze_hype_score(headlines, ticker, company_name, price_data)
-
-            if analysis_result:
-                agg = analysis_result["aggregated_scores"]
-                logger.info(f"✅ {ticker}: Sentiment={agg['final_sentiment']} ({agg['sentiment_confidence']}), Hype={agg['final_hype']} ({agg['hype_confidence']})")
-
-                # Store original headlines for CSV export
-                analysis_result["original_headlines"] = headlines
-
-                # Save to database (commits immediately for this ticker)
-                if save_to_sql_database(analysis_result):
-                    results.append(analysis_result)
-                else:
-                    failed_tickers.append((ticker, "database_save_failed"))
-            else:
-                logger.error(f"❌ Analysis failed for {ticker}")
-                failed_tickers.append((ticker, "llm_analysis_failed"))
-
-        except Exception as e:
-            logger.error(f"❌ Unexpected error processing {ticker}: {e}")
-            failed_tickers.append((ticker, str(e)))
-            # Continue to next ticker instead of crashing the entire pipeline
-            continue
-
-    # Summary log
+    # Retry pass: attempt to recover failed tickers
     if failed_tickers:
-        logger.warning(f"⚠️ Failed tickers: {failed_tickers}")
-    logger.info(f"✅ Successfully processed {len(results)}/{len(TICKERS)} tickers")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"RETRY PHASE: Attempting to recover {len(failed_tickers)} failed ticker(s)")
+        logger.info(f"{'='*60}")
 
+        still_failed = []
+
+        for attempt in range(ORCHESTRATION_MAX_RETRIES):
+            if not failed_tickers:
+                break
+
+            logger.info(f"\n--- Retry attempt {attempt + 1}/{ORCHESTRATION_MAX_RETRIES} ---")
+            # Wait before retry to let transient issues resolve
+            time.sleep(10)
+
+            retry_queue = failed_tickers
+            failed_tickers = []
+
+            for ticker, error_type, cached_result in retry_queue:
+                # If we have cached analysis result and only DB failed, just retry DB save
+                if error_type == "database_save_failed" and cached_result is not None:
+                    logger.info(f"Retrying database save for {ticker}...")
+                    if save_to_sql_database(cached_result):
+                        logger.info(f"✅ Recovery successful for {ticker}")
+                        results.append(cached_result)
+                    else:
+                        failed_tickers.append((ticker, error_type, cached_result))
+                else:
+                    # Need to re-run the full pipeline
+                    logger.info(f"Retrying full pipeline for {ticker}...")
+                    analysis_result, new_error_type = _process_single_ticker(ticker)
+                    if new_error_type is None:
+                        logger.info(f"✅ Recovery successful for {ticker}")
+                        results.append(analysis_result)
+                    else:
+                        failed_tickers.append((ticker, new_error_type, analysis_result))
+
+        still_failed = failed_tickers
+
+        # Final summary
+        if still_failed:
+            logger.error(f"❌ Permanently failed tickers after all retries: {[(t, e) for t, e, _ in still_failed]}")
+
+    logger.info(f"✅ Successfully processed {len(results)}/{len(TICKERS)} tickers")
     return results
 
 
