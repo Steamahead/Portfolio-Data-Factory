@@ -313,7 +313,8 @@ def calculate_weighted_averages(articles: list[dict]) -> dict:
     articles_used_hype = 0
 
     for article in articles:
-        if article["filter"]["excluded"]:
+        filt = article.get("filter") or {}
+        if filt.get("excluded"):
             continue
 
         quality = calculate_quality_scores(article)
@@ -323,18 +324,18 @@ def calculate_weighted_averages(articles: list[dict]) -> dict:
             continue
 
         # Sentiment weighted average
-        if scores["sentiment_raw"] is not None and article["filter"]["sentiment_usable"] != "NO":
+        if scores.get("sentiment_raw") is not None and filt.get("sentiment_usable") != "NO":
             weight = quality["quality_sentiment"]
-            if article["filter"]["sentiment_usable"] == "PARTIAL":
+            if filt.get("sentiment_usable") == "PARTIAL":
                 weight *= 0.7
             sentiment_sum += scores["sentiment_raw"] * weight
             sentiment_weight_sum += weight
             articles_used_sentiment += 1
 
         # Hype weighted average (WEIGHTED BY SPECULATION SIGNAL)
-        if scores["hype_raw"] is not None and article["filter"]["hype_usable"] != "NO":
+        if scores.get("hype_raw") is not None and filt.get("hype_usable") != "NO":
             weight = quality["quality_hype"]
-            if article["filter"]["hype_usable"] == "PARTIAL":
+            if filt.get("hype_usable") == "PARTIAL":
                 weight *= 0.7
             hype_sum += scores["hype_raw"] * weight
             hype_weight_sum += weight
@@ -468,16 +469,16 @@ def _execute_database_save(final_data: dict, conn_str: str) -> bool:
             qual = calculate_quality_scores(art)
             qm = art.get("quality_metrics") or {}
             sc = art.get("scores") or {}
-            filt = art["filter"]
+            filt = art.get("filter") or {}
 
             params_art = (
-                meta["analysis_date"], meta["ticker"], art["article_num"], art["headline_preview"][:250],
-                filt["is_about_company"], filt["sentiment_usable"], filt["hype_usable"],
-                1 if filt["excluded"] else 0, filt.get("exclusion_reason"),
+                meta["analysis_date"], meta["ticker"], art.get("article_num"), (art.get("headline_preview") or "")[:250],
+                filt.get("is_about_company"), filt.get("sentiment_usable"), filt.get("hype_usable"),
+                1 if filt.get("excluded") else 0, filt.get("exclusion_reason"),
                 qm.get("centrality"), qm.get("credibility_sentiment"), qm.get("credibility_hype"), qm.get("recency"), qm.get("materiality"), qm.get("speculation_signal"),
                 qual["quality_sentiment"], qual["quality_hype"],
                 sc.get("sentiment_raw"), sc.get("hype_raw"),
-                art.get("reasoning", "")[:2000]
+                (art.get("reasoning") or "")[:2000]
             )
             cursor.execute(sql_art, params_art)
 
