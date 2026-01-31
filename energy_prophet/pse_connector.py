@@ -59,19 +59,40 @@ class PSEConnector:
         })
 
     def _fetch(self, endpoint: str, date_str: str) -> Optional[pd.DataFrame]:
-        """Pobiera dane z endpointu PSE API."""
+        """Pobiera dane z endpointu PSE API z obsługą paginacji (nextLink)."""
         url = f"{self.base_url}/{endpoint}"
         params = {"$filter": f"business_date eq '{date_str}'"}
 
-        try:
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            records = data.get("value", []) if isinstance(data, dict) else data
+        all_records = []
+        page = 1
 
-            if records:
-                logging.info(f"  ✓ {endpoint}: {len(records)} rows")
-                return pd.DataFrame(records)
+        try:
+            while url:
+                if page == 1:
+                    resp = self.session.get(url, params=params, timeout=self.timeout)
+                else:
+                    # nextLink contains full URL with params
+                    resp = self.session.get(url, timeout=self.timeout)
+
+                resp.raise_for_status()
+                data = resp.json()
+                records = data.get("value", []) if isinstance(data, dict) else data
+
+                if records:
+                    all_records.extend(records)
+
+                # Check for pagination
+                next_link = data.get("nextLink") if isinstance(data, dict) else None
+                if next_link:
+                    url = next_link
+                    page += 1
+                else:
+                    url = None
+
+            if all_records:
+                logging.info(f"  ✓ {endpoint}: {len(all_records)} rows" + (f" ({page} pages)" if page > 1 else ""))
+                return pd.DataFrame(all_records)
+
             logging.warning(f"  ⚠ {endpoint}: empty")
             return pd.DataFrame()
 
