@@ -14,7 +14,7 @@ import pyodbc
 import requests
 import yfinance as yf
 from google import genai
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -529,41 +529,47 @@ def save_to_sql_database(final_data: dict) -> bool:
 # --- 5. DATA FETCHING FUNCTIONS ---
 
 def fetch_price_data(ticker: str) -> dict | None:
-    """Fetch 2 months of price data and calculate 30-day moving average."""
+    """Fetch price data and check if market is open today."""
     logger.info(f"Fetching price data for {ticker}")
 
     try:
         stock = yf.Ticker(ticker)
-        df = stock.history(period="2mo")
+        # Fetch slightly more data to ensure we have context even after long holidays
+        df = stock.history(period="60d")
+
+        if df is None or df.empty:
+            logger.warning(f"No price data for {ticker}")
+            return None
+
+        # === STALE DATA GUARD ===
+        # Ensure we are comparing dates correctly (UTC vs Date object)
+        last_market_date = df.index[-1].date()
+        today = datetime.now(timezone.utc).date()
+
+        if last_market_date < today:
+            logger.warning(
+                f"🛑 Market closed today (Weekend/Holiday). "
+                f"Yahoo data is stale (from {last_market_date}). "
+                f"Skipping {ticker} to protect DB from overwrite."
+            )
+            return None
+        # === END GUARD ===
+
+        price = df['Close'].iloc[-1]
+        ma_30 = df['Close'].tail(30).mean()
+        # Calculate gap between current price and 30-day Moving Average
+        gap_pct = ((price - ma_30) / ma_30) * 100
+
+        return {
+            "trading_date": last_market_date,
+            "current_price": round(price, 2),
+            "ma_30": round(ma_30, 2),
+            "gap_percent": round(gap_pct, 2),
+        }
+
     except Exception as e:
-        logger.error(f"yfinance error for {ticker}: {e}")
+        logger.error(f"Failed to fetch price for {ticker}: {e}")
         return None
-
-    if df is None or df.empty:
-        logger.warning(f"No price data returned for {ticker}, skipping.")
-        return None
-
-    if len(df) < 30:
-        logger.warning(f"Insufficient data for 30-day MA for {ticker}, using available data.")
-        ma_30 = df["Close"].mean()
-    else:
-        ma_30 = df["Close"].tail(30).mean()
-
-    last_row = df.iloc[-1]
-    trading_date = df.index[-1].date()
-    current_price = last_row["Close"]
-
-    if ma_30 == 0:
-        ma_30 = 0.01
-
-    gap_percent = ((current_price - ma_30) / ma_30) * 100
-
-    return {
-        "trading_date": trading_date,
-        "current_price": round(current_price, 2),
-        "ma_30": round(ma_30, 2),
-        "gap_percent": round(gap_percent, 2),
-    }
 
 
 def fetch_news(ticker: str, trading_date) -> list[str]:
