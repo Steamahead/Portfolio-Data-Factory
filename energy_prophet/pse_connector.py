@@ -58,6 +58,12 @@ class PSEConnector:
             "User-Agent": "EnergyProphet/1.0"
         })
 
+    def _clean_float(self, value) -> Optional[float]:
+        """Convert value to float, handling None and empty strings."""
+        if value is None or value == "":
+            return None
+        return float(value)
+
     def _fetch(self, endpoint: str, date_str: str) -> Optional[pd.DataFrame]:
         """Pobiera dane z endpointu PSE API z obsługą paginacji (nextLink)."""
         url = f"{self.base_url}/{endpoint}"
@@ -430,8 +436,10 @@ class PSEConnector:
         """
         for _, r in df.iterrows():
             cursor.execute(sql, r['dtime'], r['business_date'],
-                r.get('pv_red_balance'), r.get('pv_red_network'),
-                r.get('wi_red_balance'), r.get('wi_red_network'))
+                self._clean_float(r.get('pv_red_balance')),
+                self._clean_float(r.get('pv_red_network')),
+                self._clean_float(r.get('wi_red_balance')),
+                self._clean_float(r.get('wi_red_network')))
 
     def _upsert_co2(self, cursor, df: pd.DataFrame):
         """co2_prices ← rcco2"""
