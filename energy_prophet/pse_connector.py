@@ -59,10 +59,19 @@ class PSEConnector:
         })
 
     def _clean_float(self, value) -> Optional[float]:
-        """Convert value to float, handling None and empty strings."""
-        if value is None or value == "":
+        """Convert value to float, handling None, empty strings, NaN, and whitespace."""
+        if value is None:
             return None
-        return float(value)
+        if pd.isna(value):
+            return None
+        if isinstance(value, str):
+            value = value.strip()
+            if value == "":
+                return None
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return None
 
     def _fetch(self, endpoint: str, date_str: str) -> Optional[pd.DataFrame]:
         """Pobiera dane z endpointu PSE API z obsługą paginacji (nextLink)."""
@@ -209,7 +218,8 @@ class PSEConnector:
             VALUES (S.dtime, S.business_date, S.rce_pln);
         """
         for _, r in df.iterrows():
-            cursor.execute(sql, r['dtime'], r['business_date'], r['rce_pln'])
+            cursor.execute(sql, r['dtime'], r['business_date'],
+                self._clean_float(r.get('rce_pln')))
 
     def _upsert_generation_mix(self, cursor, actuals: pd.DataFrame,
                                 load_fcst: pd.DataFrame, oze_fcst: pd.DataFrame):
@@ -395,7 +405,8 @@ class PSEConnector:
             VALUES (S.dtime, S.business_date, S.section_code, S.value_mw);
         """
         for _, r in df.iterrows():
-            cursor.execute(sql, r['dtime'], r['business_date'], r['section_code'], r['value'])
+            cursor.execute(sql, r['dtime'], r['business_date'], r['section_code'],
+                self._clean_float(r.get('value')))
 
     def _upsert_alerts(self, cursor, df: pd.DataFrame):
         """pse_alerts ← pdgsz (deduplicated)"""
@@ -453,7 +464,9 @@ class PSEConnector:
             VALUES (S.business_date, S.rcco2_eur, S.rcco2_pln);
         """
         for _, r in df.iterrows():
-            cursor.execute(sql, r['business_date'], r.get('rcco2_eur'), r.get('rcco2_pln'))
+            cursor.execute(sql, r['business_date'],
+                self._clean_float(r.get('rcco2_eur')),
+                self._clean_float(r.get('rcco2_pln')))
 
     def _upsert_settlement(self, cursor, df: pd.DataFrame, endpoint: str):
         """balancing_settlement ← *-rozl (D+7)"""
