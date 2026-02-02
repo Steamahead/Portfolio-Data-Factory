@@ -44,24 +44,37 @@ class WeatherConnector:
             'Suwalki': {'lat': 54.11, 'lon': 22.93},  # "Biegun Zimna" (Peak zimowy)
         }
 
+    def _get_location_type(self, city):
+        """Categorize location by primary OZE type or demand center"""
+        wind_locations = ['Darlowo', 'Slupsk', 'Bialogard', 'Sztum', 'Zuromin']
+        solar_locations = ['Konin', 'Stargard', 'Wejherowo', 'Zagan', 'Legnica', 'Zamosc']
+        demand_locations = ['Warszawa', 'Katowice', 'Lodz', 'Krakow', 'Suwalki']
+
+        if city in wind_locations:
+            return 'WIND'
+        if city in solar_locations:
+            return 'SOLAR'
+        if city in demand_locations:
+            return 'DEMAND'
+        return 'MIXED'
+
     def run_etl(self, target_date):
         """Pobiera pogodę dla klastrów energetycznych"""
         try:
-            logging.info(f"   ☁️ Fetching weather data for {len(self.locations)} strategic clusters...")
+            logging.info(f"   Fetching weather data for {len(self.locations)} strategic clusters...")
             df = self._fetch_weather(target_date)
             if not df.empty:
                 self._save_to_sql(df)
-                logging.info(f"   ✓ Weather data saved: {len(df)} rows")
+                logging.info(f"   Weather data saved: {len(df)} rows")
             else:
-                logging.warning("   ⚠️ No weather data fetched.")
+                logging.warning("   No weather data fetched.")
         except Exception as e:
-            logging.error(f"   ❌ Weather ETL Failed: {e}")
+            logging.error(f"   Weather ETL Failed: {e}")
             raise e
 
     def _fetch_weather(self, date):
         all_data = []
         date_str = date.strftime('%Y-%m-%d')
-        # Używamy forecast API dla danych bieżących (najbardziej aktualne)
         url = "https://api.open-meteo.com/v1/forecast"
 
         for city, coords in self.locations.items():
@@ -70,7 +83,7 @@ class WeatherConnector:
                 "longitude": coords['lon'],
                 "start_date": date_str,
                 "end_date": date_str,
-                "hourly": "temperature_2m,wind_speed_10m,direct_radiation,cloud_cover",
+                "hourly": "temperature_2m,wind_speed_10m,wind_direction_10m,direct_radiation,cloud_cover",
                 "timezone": "Europe/Warsaw"
             }
 
@@ -83,19 +96,27 @@ class WeatherConnector:
                 times = hourly.get('time', [])
                 temps = hourly.get('temperature_2m', [])
                 winds = hourly.get('wind_speed_10m', [])
+                wind_dirs = hourly.get('wind_direction_10m', [])
                 solar = hourly.get('direct_radiation', [])
                 clouds = hourly.get('cloud_cover', [])
 
                 for i, t_str in enumerate(times):
+                    dt = pd.to_datetime(t_str)
                     all_data.append({
                         'location': city,
-                        'dtime': t_str,
-                        'temp_c': temps[i],
-                        'wind_kph': winds[i],
-                        'solar_rad': solar[i],
-                        'cloud_cover': clouds[i]
+                        'location_type': self._get_location_type(city),
+                        'dtime': dt,
+                        'business_date': dt.strftime('%Y-%m-%d'),
+                        'hour': dt.hour,
+                        'lat': coords['lat'],
+                        'lon': coords['lon'],
+                        'temp_c': temps[i] if temps else None,
+                        'wind_kph': winds[i] if winds else None,
+                        'wind_direction': wind_dirs[i] if wind_dirs else None,
+                        'solar_rad': solar[i] if solar else None,
+                        'cloud_cover': clouds[i] if clouds else None
                     })
-                time.sleep(0.1)  # Grzeczność wobec API
+                time.sleep(0.1)  # Grzecznosc wobec API
 
             except Exception as e:
                 logging.error(f"Error fetching {city}: {e}")
@@ -108,31 +129,44 @@ class WeatherConnector:
         if df.empty:
             return
 
-        # DDL - Tabela na dane pogodowe
+        # DDL - Enhanced table for Power BI visualization
         create_table_sql = """
         IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'weather_data')
         CREATE TABLE weather_data (
-            location VARCHAR(50),
-            dtime DATETIME,
-            temp_c FLOAT,
-            wind_kph FLOAT,
-            solar_rad FLOAT,
-            cloud_cover FLOAT,
-            updated_at DATETIME DEFAULT GETDATE(),
-            PRIMARY KEY (location, dtime)
+            id              INT IDENTITY(1,1) PRIMARY KEY,
+            location        VARCHAR(50) NOT NULL,
+            location_type   VARCHAR(10) NOT NULL,
+            dtime           DATETIME NOT NULL,
+            business_date   DATE NOT NULL,
+            hour            TINYINT NOT NULL,
+            lat             DECIMAL(6,4),
+            lon             DECIMAL(6,4),
+            temp_c          DECIMAL(5,2),
+            wind_kph        DECIMAL(5,2),
+            wind_direction  SMALLINT,
+            solar_rad       DECIMAL(8,2),
+            cloud_cover     TINYINT,
+            created_at      DATETIME DEFAULT GETDATE(),
+            UNIQUE (location, dtime)
         );
         """
 
-        # UPSERT - Aktualizuj jeśli istnieje, wstaw jeśli nowe
+        # UPSERT with new columns
         merge_sql = """
         MERGE INTO weather_data AS T
-        USING (SELECT ? as loc, ? as dt, ? as tmp, ? as wnd, ? as sol, ? as cld) AS S
+        USING (SELECT ? as loc, ? as loc_type, ? as dt, ? as biz_date, ? as hr,
+                      ? as lat, ? as lon, ? as tmp, ? as wnd, ? as wnd_dir, ? as sol, ? as cld) AS S
         ON T.location = S.loc AND T.dtime = S.dt
         WHEN MATCHED THEN UPDATE SET
-            temp_c = S.tmp, wind_kph = S.wnd, solar_rad = S.sol, cloud_cover = S.cld, updated_at = GETDATE()
+            location_type = S.loc_type, business_date = S.biz_date, hour = S.hr,
+            lat = S.lat, lon = S.lon, temp_c = S.tmp, wind_kph = S.wnd,
+            wind_direction = S.wnd_dir, solar_rad = S.sol, cloud_cover = S.cld,
+            created_at = GETDATE()
         WHEN NOT MATCHED THEN INSERT
-            (location, dtime, temp_c, wind_kph, solar_rad, cloud_cover)
-            VALUES (S.loc, S.dt, S.tmp, S.wnd, S.sol, S.cld);
+            (location, location_type, dtime, business_date, hour, lat, lon,
+             temp_c, wind_kph, wind_direction, solar_rad, cloud_cover)
+            VALUES (S.loc, S.loc_type, S.dt, S.biz_date, S.hr, S.lat, S.lon,
+                    S.tmp, S.wnd, S.wnd_dir, S.sol, S.cld);
         """
 
         with pyodbc.connect(self.sql_conn_str) as conn:
@@ -141,9 +175,22 @@ class WeatherConnector:
             conn.commit()
 
             for _, r in df.iterrows():
-                # Bezpieczne wstawianie (obsługa NULL/None)
-                vals = [r['location'], r['dtime'], r['temp_c'], r['wind_kph'], r['solar_rad'], r['cloud_cover']]
+                dtime_val = r['dtime'].to_pydatetime()
+                vals = [
+                    r['location'],
+                    r['location_type'],
+                    dtime_val,
+                    r['business_date'],
+                    r['hour'],
+                    r['lat'],
+                    r['lon'],
+                    r['temp_c'],
+                    r['wind_kph'],
+                    r['wind_direction'],
+                    r['solar_rad'],
+                    r['cloud_cover']
+                ]
                 vals = [None if pd.isna(v) else v for v in vals]
 
-                cursor.execute(merge_sql, vals[0], vals[1], vals[2], vals[3], vals[4], vals[5])
+                cursor.execute(merge_sql, *vals)
             conn.commit()
