@@ -24,4 +24,4 @@ __pycache__/
 bin/
 obj/
 appsettings.json
-!energy_prophet/function.json
+!EnergyDailyRun/function.json
