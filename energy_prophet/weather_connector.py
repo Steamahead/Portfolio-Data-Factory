@@ -3,6 +3,7 @@ import pandas as pd
 import pyodbc
 import logging
 import time
+import datetime  # <--- WAŻNY NOWY IMPORT
 
 
 class WeatherConnector:
@@ -10,38 +11,26 @@ class WeatherConnector:
         self.sql_conn_str = sql_conn_str
 
         # SIATKA 'POWER CLUSTERS' (URE 09.2025)
-        # Pokrywa Top 5 Powiatów Wiatrowych i Top 5 Solarnych w Polsce.
         self.locations = {
-            # --- TIER 1: GIGANCI OZE (Bezpośrednie pokrycie Top 5) ---
-            # Wiatr #1 (Sławno) + Wiatr #5 (Kołobrzeg - proxy)
+            # --- TIER 1: GIGANCI OZE ---
             'Darlowo': {'lat': 54.42, 'lon': 16.41},
-
-            # Solar #1 (Konin) + Solar #2 (Turek - 15km obok) -> "Wielkopolska Dolina Energii"
             'Konin': {'lat': 52.22, 'lon': 18.25},
-
-            # Wiatr #2 (Słupsk) + Solar #5 (Słupsk) -> Hybrydowe serce północy
             'Slupsk': {'lat': 54.46, 'lon': 17.02},
-
-            # Wiatr #3 (Białogard)
             'Bialogard': {'lat': 54.00, 'lon': 15.98},
-
-            # Wiatr #4 (Sztum/Powiśle) + Kisielice
             'Sztum': {'lat': 53.92, 'lon': 19.03},
-
-            # --- TIER 2: KLUCZOWE REGIONY (Top 10) ---
-            'Zuromin': {'lat': 53.06, 'lon': 19.91},  # Wiatr: Ukryty gigant Mazowsza
-            'Stargard': {'lat': 53.33, 'lon': 15.03},  # Solar #3: Zachodniopomorskie
-            'Wejherowo': {'lat': 54.60, 'lon': 18.24},  # Solar #4: Pomorze
-            'Zagan': {'lat': 51.61, 'lon': 15.31},  # Solar: Lubuskie ("Polski Teksas")
-            'Legnica': {'lat': 51.20, 'lon': 16.16},  # Solar: Dolny Śląsk
-            'Zamosc': {'lat': 50.72, 'lon': 23.25},  # Solar: Stabilizacja wschodnia
-
-            # --- TIER 3: POPYT (LUDZIE I PRZEMYSŁ) ---
-            'Warszawa': {'lat': 52.22, 'lon': 21.01},  # Biura (Load szczytowy)
-            'Katowice': {'lat': 50.26, 'lon': 19.02},  # Przemysł (Load bazowy)
-            'Lodz': {'lat': 51.75, 'lon': 19.45},  # Logistyka
-            'Krakow': {'lat': 50.06, 'lon': 19.94},  # Południe
-            'Suwalki': {'lat': 54.11, 'lon': 22.93},  # "Biegun Zimna" (Peak zimowy)
+            # --- TIER 2: KLUCZOWE REGIONY ---
+            'Zuromin': {'lat': 53.06, 'lon': 19.91},
+            'Stargard': {'lat': 53.33, 'lon': 15.03},
+            'Wejherowo': {'lat': 54.60, 'lon': 18.24},
+            'Zagan': {'lat': 51.61, 'lon': 15.31},
+            'Legnica': {'lat': 51.20, 'lon': 16.16},
+            'Zamosc': {'lat': 50.72, 'lon': 23.25},
+            # --- TIER 3: POPYT ---
+            'Warszawa': {'lat': 52.22, 'lon': 21.01},
+            'Katowice': {'lat': 50.26, 'lon': 19.02},
+            'Lodz': {'lat': 51.75, 'lon': 19.45},
+            'Krakow': {'lat': 50.06, 'lon': 19.94},
+            'Suwalki': {'lat': 54.11, 'lon': 22.93},
         }
 
     def _get_location_type(self, city):
@@ -50,12 +39,9 @@ class WeatherConnector:
         solar_locations = ['Konin', 'Stargard', 'Wejherowo', 'Zagan', 'Legnica', 'Zamosc']
         demand_locations = ['Warszawa', 'Katowice', 'Lodz', 'Krakow', 'Suwalki']
 
-        if city in wind_locations:
-            return 'WIND'
-        if city in solar_locations:
-            return 'SOLAR'
-        if city in demand_locations:
-            return 'DEMAND'
+        if city in wind_locations: return 'WIND'
+        if city in solar_locations: return 'SOLAR'
+        if city in demand_locations: return 'DEMAND'
         return 'MIXED'
 
     def run_etl(self, target_date):
@@ -73,10 +59,19 @@ class WeatherConnector:
             raise e
 
     def _fetch_weather(self, date):
+        import time  # Upewnij się, że masz ten import na górze pliku
+
         all_data = []
         date_str = date.strftime('%Y-%m-%d')
-        url = "https://api.open-meteo.com/v1/forecast"
 
+        # --- LOGIKA: API vs ARCHIVE ---
+        days_diff = (datetime.date.today() - date).days
+        if days_diff > 10:
+            base_url = "https://archive-api.open-meteo.com/v1/archive"
+        else:
+            base_url = "https://api.open-meteo.com/v1/forecast"
+
+        # Pętla po miastach
         for city, coords in self.locations.items():
             params = {
                 "latitude": coords['lat'],
@@ -87,39 +82,57 @@ class WeatherConnector:
                 "timezone": "Europe/Warsaw"
             }
 
-            try:
-                r = requests.get(url, params=params)
-                r.raise_for_status()
-                data = r.json()
+            # --- MECHANIZM PONAWIANIA (RETRY LOGIC) ---
+            max_retries = 3
+            success = False
 
-                hourly = data.get('hourly', {})
-                times = hourly.get('time', [])
-                temps = hourly.get('temperature_2m', [])
-                winds = hourly.get('wind_speed_10m', [])
-                wind_dirs = hourly.get('wind_direction_10m', [])
-                solar = hourly.get('direct_radiation', [])
-                clouds = hourly.get('cloud_cover', [])
+            for attempt in range(max_retries):
+                try:
+                    # Timeout 20s
+                    r = requests.get(base_url, params=params, timeout=20)
+                    r.raise_for_status()  # Rzuć błąd jeśli kod != 200
+                    data = r.json()
 
-                for i, t_str in enumerate(times):
-                    dt = pd.to_datetime(t_str)
-                    all_data.append({
-                        'location': city,
-                        'location_type': self._get_location_type(city),
-                        'dtime': dt,
-                        'business_date': dt.strftime('%Y-%m-%d'),
-                        'hour': dt.hour,
-                        'lat': coords['lat'],
-                        'lon': coords['lon'],
-                        'temp_c': temps[i] if temps else None,
-                        'wind_kph': winds[i] if winds else None,
-                        'wind_direction': wind_dirs[i] if wind_dirs else None,
-                        'solar_rad': solar[i] if solar else None,
-                        'cloud_cover': clouds[i] if clouds else None
-                    })
-                time.sleep(0.1)  # Grzecznosc wobec API
+                    hourly = data.get('hourly', {})
+                    times = hourly.get('time', [])
+                    temps = hourly.get('temperature_2m', [])
+                    winds = hourly.get('wind_speed_10m', [])
+                    wind_dirs = hourly.get('wind_direction_10m', [])
+                    solar = hourly.get('direct_radiation', [])
+                    clouds = hourly.get('cloud_cover', [])
 
-            except Exception as e:
-                logging.error(f"Error fetching {city}: {e}")
+                    for i, t_str in enumerate(times):
+                        dt = pd.to_datetime(t_str)
+                        all_data.append({
+                            'location': city,
+                            'location_type': self._get_location_type(city),
+                            'dtime': dt,
+                            'business_date': dt.strftime('%Y-%m-%d'),
+                            'hour': dt.hour,
+                            'lat': coords['lat'],
+                            'lon': coords['lon'],
+                            'temp_c': temps[i] if temps else None,
+                            'wind_kph': winds[i] if winds else None,
+                            'wind_direction': wind_dirs[i] if wind_dirs else None,
+                            'solar_rad': solar[i] if solar else None,
+                            'cloud_cover': clouds[i] if clouds else None
+                        })
+
+                    success = True
+                    break  # Udało się! Wychodzimy z pętli prób
+
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 5  # Czekamy 5s, potem 10s...
+                        logging.warning(
+                            f"   ⚠️ Connection dropped for {city}. Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries})")
+                        time.sleep(wait_time)
+                    else:
+                        logging.error(f"   ❌ Failed to fetch {city} after {max_retries} attempts: {e}")
+
+            # Jeśli udało się pobrać, robimy krótką pauzę przed kolejnym miastem
+            if success:
+                time.sleep(0.5)
 
         if not all_data:
             return pd.DataFrame()

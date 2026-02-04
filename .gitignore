@@ -25,3 +25,4 @@ bin/
 obj/
 appsettings.json
 !EnergyDailyRun/function.json
+energy_prophet/backfill_safe.py
