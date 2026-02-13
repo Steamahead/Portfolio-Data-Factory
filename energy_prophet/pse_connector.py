@@ -58,6 +58,23 @@ class PSEConnector:
             "User-Agent": "EnergyProphet/1.0"
         })
 
+    def _connect_with_retry(self, conn_str: str, max_retries: int = 3):
+        """Połączenie SQL z retry logic i Connection Timeout."""
+        import time
+        for attempt in range(max_retries):
+            try:
+                cs = conn_str
+                if 'Connection Timeout' not in cs:
+                    cs += ';Connection Timeout=30'
+                return pyodbc.connect(cs)
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5
+                    logging.warning(f"  ⚠️ SQL connection failed. Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(wait_time)
+                else:
+                    raise
+
     def _clean_float(self, value) -> Optional[float]:
         """Convert value to float, handling None, empty strings, NaN, and whitespace."""
         if value is None:
@@ -149,7 +166,7 @@ class PSEConnector:
 
             # Upload do SQL
             try:
-                with pyodbc.connect(conn_str) as conn:
+                with self._connect_with_retry(conn_str) as conn:
                     cursor = conn.cursor()
 
                     # 1. ENERGY_PRICES
@@ -469,10 +486,107 @@ class PSEConnector:
                 self._clean_float(r.get('rcco2_pln')))
 
     def _upsert_settlement(self, cursor, df: pd.DataFrame, endpoint: str):
-        """balancing_settlement ← *-rozl (D+7)"""
+        """balancing_settlement ← crb-rozl / eb-rozl / en-rozl / ro-rozl (D+7)
+
+        Każdy endpoint aktualizuje SWOJE kolumny w jednej wide table.
+        Klucz: (business_date, dtime). Wspólne kolumny: period, dtime_utc, period_utc.
+        """
         logging.info(f"    → balancing_settlement ({endpoint})")
-        # Placeholder - nazwy kolumn do weryfikacji gdy będą dane
-        pass
+
+        # DDL - tworzymy tabelę jeśli nie istnieje
+        cursor.execute("""
+        IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'balancing_settlement')
+        CREATE TABLE balancing_settlement (
+            business_date       DATE           NOT NULL,
+            dtime               DATETIME2      NOT NULL,
+            period              NVARCHAR(20)   NULL,
+            dtime_utc           DATETIME2      NULL,
+            period_utc          NVARCHAR(20)   NULL,
+            -- crb-rozl
+            cen_cost            DECIMAL(18,5)  NULL,
+            ckoeb_cost          DECIMAL(18,5)  NULL,
+            ceb_pp_cost         DECIMAL(18,5)  NULL,
+            ceb_sr_cost         DECIMAL(18,5)  NULL,
+            ceb_sr_afrrd_cost   DECIMAL(18,5)  NULL,
+            ceb_sr_afrrg_cost   DECIMAL(18,5)  NULL,
+            -- eb-rozl
+            eb_d_pp             DECIMAL(18,5)  NULL,
+            eb_w_pp             DECIMAL(18,5)  NULL,
+            eb_afrrd            DECIMAL(18,5)  NULL,
+            eb_afrrg            DECIMAL(18,5)  NULL,
+            -- en-rozl
+            en_d                DECIMAL(18,5)  NULL,
+            en_w                DECIMAL(18,5)  NULL,
+            balance             DECIMAL(18,5)  NULL,
+            -- ro-rozl
+            ro_cost             DECIMAL(18,5)  NULL,
+            -- audit
+            created_at          DATETIME2      DEFAULT GETUTCDATE(),
+            updated_at          DATETIME2      DEFAULT GETUTCDATE(),
+            CONSTRAINT PK_balancing_settlement PRIMARY KEY (business_date, dtime)
+        );
+        """)
+
+        # Mapowanie endpoint → kolumny do upsert
+        column_map = {
+            'crb-rozl': {
+                'cols': ['cen_cost', 'ckoeb_cost', 'ceb_pp_cost', 'ceb_sr_cost',
+                         'ceb_sr_afrrd_cost', 'ceb_sr_afrrg_cost'],
+                'fields': ['cen_cost', 'ckoeb_cost', 'ceb_pp_cost', 'ceb_sr_cost',
+                           'ceb_sr_afrrd_cost', 'ceb_sr_afrrg_cost'],
+            },
+            'eb-rozl': {
+                'cols': ['eb_d_pp', 'eb_w_pp', 'eb_afrrd', 'eb_afrrg'],
+                'fields': ['eb_d_pp', 'eb_w_pp', 'eb_afrrd', 'eb_afrrg'],
+            },
+            'en-rozl': {
+                'cols': ['en_d', 'en_w', 'balance'],
+                'fields': ['en_d', 'en_w', 'balance'],
+            },
+            'ro-rozl': {
+                'cols': ['ro_cost'],
+                'fields': ['ro_cost'],
+            },
+        }
+
+        if endpoint not in column_map:
+            logging.warning(f"    ⚠ Unknown settlement endpoint: {endpoint}")
+            return
+
+        ep_cfg = column_map[endpoint]
+        cols = ep_cfg['cols']
+        fields = ep_cfg['fields']
+
+        # Budujemy dynamiczny MERGE SQL
+        source_cols = ', '.join([f'? AS {c}' for c in cols])
+        update_set = ', '.join([f'{c} = S.{c}' for c in cols])
+        insert_cols = ', '.join(['business_date', 'dtime', 'period', 'dtime_utc', 'period_utc'] + cols)
+        insert_vals = ', '.join(['S.business_date', 'S.dtime', 'S.period', 'S.dtime_utc', 'S.period_utc'] + [f'S.{c}' for c in cols])
+
+        sql = f"""
+        MERGE INTO balancing_settlement AS T
+        USING (SELECT ? AS business_date, ? AS dtime, ? AS period, ? AS dtime_utc, ? AS period_utc,
+                      {source_cols}) AS S
+        ON T.business_date = S.business_date AND T.dtime = S.dtime
+        WHEN MATCHED THEN UPDATE SET
+            {update_set}, updated_at = GETUTCDATE()
+        WHEN NOT MATCHED THEN INSERT
+            ({insert_cols}, created_at, updated_at)
+            VALUES ({insert_vals}, GETUTCDATE(), GETUTCDATE());
+        """
+
+        for _, r in df.iterrows():
+            params = [
+                r.get('business_date'),
+                r.get('dtime'),
+                r.get('period'),
+                r.get('dtime_utc'),
+                r.get('period_utc'),
+            ]
+            for f in fields:
+                params.append(self._clean_float(r.get(f)))
+
+            cursor.execute(sql, *params)
 
     def _upsert_outages(self, cursor, df: pd.DataFrame):
         """Tabela: planned_outages (unav-pk5l)"""

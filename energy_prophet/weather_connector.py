@@ -3,7 +3,7 @@ import pandas as pd
 import pyodbc
 import logging
 import time
-import datetime  # <--- WAŻNY NOWY IMPORT
+import datetime
 
 
 class WeatherConnector:
@@ -59,8 +59,7 @@ class WeatherConnector:
             raise e
 
     def _fetch_weather(self, date):
-        import time  # Upewnij się, że masz ten import na górze pliku
-
+        """Batch fetch - wszystkie 16 lokalizacji w JEDNYM request do Open-Meteo."""
         all_data = []
         date_str = date.strftime('%Y-%m-%d')
 
@@ -71,28 +70,35 @@ class WeatherConnector:
         else:
             base_url = "https://api.open-meteo.com/v1/forecast"
 
-        # Pętla po miastach
-        for city, coords in self.locations.items():
-            params = {
-                "latitude": coords['lat'],
-                "longitude": coords['lon'],
-                "start_date": date_str,
-                "end_date": date_str,
-                "hourly": "temperature_2m,wind_speed_10m,wind_direction_10m,direct_radiation,cloud_cover",
-                "timezone": "Europe/Warsaw"
-            }
+        # Przygotuj listy współrzędnych (kolejność zachowana - dict jest ordered w Python 3.7+)
+        cities = list(self.locations.keys())
+        lats = [str(self.locations[c]['lat']) for c in cities]
+        lons = [str(self.locations[c]['lon']) for c in cities]
 
-            # --- MECHANIZM PONAWIANIA (RETRY LOGIC) ---
-            max_retries = 3
-            success = False
+        params = {
+            "latitude": ",".join(lats),
+            "longitude": ",".join(lons),
+            "start_date": date_str,
+            "end_date": date_str,
+            "hourly": "temperature_2m,wind_speed_10m,wind_direction_10m,direct_radiation,cloud_cover",
+            "timezone": "Europe/Warsaw"
+        }
 
-            for attempt in range(max_retries):
-                try:
-                    # Timeout 20s
-                    r = requests.get(base_url, params=params, timeout=20)
-                    r.raise_for_status()  # Rzuć błąd jeśli kod != 200
-                    data = r.json()
+        # --- RETRY LOGIC (1 request zamiast 16) ---
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                r = requests.get(base_url, params=params, timeout=30)
+                r.raise_for_status()
+                results = r.json()
 
+                # Odpowiedź to tablica obiektów (jeden per lokalizacja)
+                if not isinstance(results, list):
+                    results = [results]
+
+                for idx, data in enumerate(results):
+                    city = cities[idx]
+                    coords = self.locations[city]
                     hourly = data.get('hourly', {})
                     times = hourly.get('time', [])
                     temps = hourly.get('temperature_2m', [])
@@ -111,32 +117,44 @@ class WeatherConnector:
                             'hour': dt.hour,
                             'lat': coords['lat'],
                             'lon': coords['lon'],
-                            'temp_c': temps[i] if temps else None,
-                            'wind_kph': winds[i] if winds else None,
-                            'wind_direction': wind_dirs[i] if wind_dirs else None,
-                            'solar_rad': solar[i] if solar else None,
-                            'cloud_cover': clouds[i] if clouds else None
+                            'temp_c': temps[i] if i < len(temps) else None,
+                            'wind_kph': winds[i] if i < len(winds) else None,
+                            'wind_direction': wind_dirs[i] if i < len(wind_dirs) else None,
+                            'solar_rad': solar[i] if i < len(solar) else None,
+                            'cloud_cover': clouds[i] if i < len(clouds) else None
                         })
 
-                    success = True
-                    break  # Udało się! Wychodzimy z pętli prób
+                logging.info(f"   ✓ Batch weather fetch OK: {len(cities)} cities, {len(all_data)} rows")
+                break  # Sukces
 
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5  # Czekamy 5s, potem 10s...
-                        logging.warning(
-                            f"   ⚠️ Connection dropped for {city}. Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries})")
-                        time.sleep(wait_time)
-                    else:
-                        logging.error(f"   ❌ Failed to fetch {city} after {max_retries} attempts: {e}")
-
-            # Jeśli udało się pobrać, robimy krótką pauzę przed kolejnym miastem
-            if success:
-                time.sleep(0.5)
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5
+                    logging.warning(
+                        f"   ⚠️ Batch weather fetch failed. Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(wait_time)
+                else:
+                    logging.error(f"   ❌ Batch weather fetch failed after {max_retries} attempts: {e}")
 
         if not all_data:
             return pd.DataFrame()
         return pd.DataFrame(all_data)
+
+    def _connect_with_retry(self, max_retries=3):
+        """Połączenie SQL z retry logic."""
+        for attempt in range(max_retries):
+            try:
+                conn_str = self.sql_conn_str
+                if 'Connection Timeout' not in conn_str:
+                    conn_str += ';Connection Timeout=30'
+                return pyodbc.connect(conn_str)
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5
+                    logging.warning(f"   ⚠️ SQL connection failed. Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(wait_time)
+                else:
+                    raise
 
     def _save_to_sql(self, df):
         if df.empty:
@@ -182,7 +200,7 @@ class WeatherConnector:
                     S.tmp, S.wnd, S.wnd_dir, S.sol, S.cld);
         """
 
-        with pyodbc.connect(self.sql_conn_str) as conn:
+        with self._connect_with_retry() as conn:
             cursor = conn.cursor()
             cursor.execute(create_table_sql)
             conn.commit()
