@@ -417,8 +417,8 @@ def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, pri
 # --- 4. DATABASE FUNCTION ---
 
 # Retry configuration (tuned for Azure SQL Serverless cold starts which can take 30-60s)
-DB_MAX_RETRIES = 4
-DB_RETRY_BASE_DELAY = 10  # seconds -> delays: 10s, 20s, 30s (total ~60s coverage)
+DB_MAX_RETRIES = 5
+DB_RETRY_BASE_DELAY = 15  # seconds -> delays: 15s, 30s, 45s, 60s (total ~150s coverage)
 
 
 def _execute_database_save(final_data: dict, conn_str: str) -> bool:
@@ -597,28 +597,35 @@ def fetch_news(ticker: str, trading_date) -> list[str]:
 
     logger.info(f"Fetching news for {ticker} | Date: {from_date} to {to_date}")
 
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+    news_max_retries = 3
+    for attempt in range(news_max_retries):
+        try:
+            response = requests.get(url, params=params, timeout=20)
+            response.raise_for_status()
+            data = response.json()
 
-        articles = data.get("articles", [])
-        headlines = []
+            articles = data.get("articles", [])
+            headlines = []
 
-        for article in articles[:10]:
-            title = article.get("title") or ""
-            desc = article.get("description") or ""
-            full_text = f"{title}. {desc}".strip().replace("\n", " ").replace("\r", " ")
-            headlines.append(full_text if full_text != "." else "N/A")
+            for article in articles[:10]:
+                title = article.get("title") or ""
+                desc = article.get("description") or ""
+                full_text = f"{title}. {desc}".strip().replace("\n", " ").replace("\r", " ")
+                headlines.append(full_text if full_text != "." else "N/A")
 
-        while len(headlines) < 10:
-            headlines.append("N/A")
+            while len(headlines) < 10:
+                headlines.append("N/A")
 
-        return headlines
+            return headlines
 
-    except requests.RequestException as e:
-        logger.error(f"NewsAPI request failed for {ticker}: {e}")
-        return ["N/A"] * 10
+        except requests.RequestException as e:
+            if attempt < news_max_retries - 1:
+                logger.warning(f"NewsAPI request failed for {ticker} (attempt {attempt + 1}/{news_max_retries}): {e}. Retrying in 5s...")
+                time.sleep(5)
+            else:
+                logger.error(f"NewsAPI request failed for {ticker} after {news_max_retries} attempts: {e}")
+
+    return ["N/A"] * 10
 
 
 # --- 6. MAIN ORCHESTRATION ---
