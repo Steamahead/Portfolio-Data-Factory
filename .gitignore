@@ -1,4 +1,5 @@
 # --- BEZPIECZEŃSTWO (Klucze i Hasła) ---
+.env
 local.settings.json
 *.json
 !host.json
@@ -14,6 +15,8 @@ __pycache__/
 *.log
 *.csv
 *.xlsx
+nul
+*/nul
 
 # --- IDE (PyCharm / VS Code) ---
 .idea/
@@ -26,3 +29,4 @@ obj/
 appsettings.json
 !EnergyDailyRun/function.json
 energy_prophet/backfill_safe.py
+energy_prophet/backfill_feb2026.py

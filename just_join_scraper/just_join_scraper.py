@@ -18,12 +18,34 @@ import requests
 import json
 import csv
 import re
+import os
 import time
 import random
 import sys
 import io
-from datetime import datetime
+import traceback
+from pathlib import Path
+from datetime import datetime, timezone
 from typing import Optional
+
+
+# --- Ladowanie .env (lokalny fallback) ---
+_SCRAPER_DIR_PATH = Path(__file__).parent
+_PROJECT_DIR = _SCRAPER_DIR_PATH.parent
+_ENV_FILE = _PROJECT_DIR / ".env"
+
+
+def _load_env():
+    """Laduje zmienne z .env jesli plik istnieje. Niezalezne od pracuj_scraper."""
+    if not _ENV_FILE.exists():
+        return
+    for line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
 
 
 # --- Konfiguracja ---
@@ -54,8 +76,111 @@ CATEGORIES = ["data", "analytics", "pm", "ai"]
 # API zwraca max 100 per request
 LISTING_PAGE_SIZE = 100
 
-OUTPUT_FILE = "justjoin_premium_selection.json"
-CSV_FILE = "justjoin_premium_selection.csv"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_FILE = os.path.join(_SCRIPT_DIR, "justjoin_premium_selection.json")
+CSV_FILE = os.path.join(_SCRIPT_DIR, "justjoin_premium_selection.csv")
+
+
+# --- Azure SQL Constants ---
+
+CREATE_TABLE_SQL = """
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'justjoin_offers')
+CREATE TABLE justjoin_offers (
+    id                  INT IDENTITY(1,1) PRIMARY KEY,
+    offer_id            NVARCHAR(200),
+    slug                NVARCHAR(500),
+    title               NVARCHAR(500),
+    company             NVARCHAR(500),
+    company_size        NVARCHAR(100),
+    city                NVARCHAR(200),
+    workplace_type      NVARCHAR(100),
+    working_time        NVARCHAR(100),
+    experience_level    NVARCHAR(100),
+    search_category     NVARCHAR(50),
+    published_at        NVARCHAR(50),
+    b2b_from            NVARCHAR(50),
+    b2b_to              NVARCHAR(50),
+    b2b_currency        NVARCHAR(10),
+    b2b_unit            NVARCHAR(20),
+    b2b_gross           NVARCHAR(10),
+    perm_from           NVARCHAR(50),
+    perm_to             NVARCHAR(50),
+    perm_currency       NVARCHAR(10),
+    perm_unit           NVARCHAR(20),
+    perm_gross          NVARCHAR(10),
+    other_type          NVARCHAR(100),
+    other_from          NVARCHAR(50),
+    other_to            NVARCHAR(50),
+    other_currency      NVARCHAR(10),
+    other_unit          NVARCHAR(20),
+    required_skills     NVARCHAR(MAX),
+    nice_to_have_skills NVARCHAR(MAX),
+    url                 NVARCHAR(1000) NOT NULL,
+    body_html           NVARCHAR(MAX),
+    scraped_at          NVARCHAR(50),
+    first_seen_at       DATETIME DEFAULT GETDATE(),
+    created_at          DATETIME DEFAULT GETDATE(),
+    UNIQUE (url)
+);
+"""
+
+MERGE_SQL = """
+MERGE INTO justjoin_offers AS T
+USING (SELECT ? as offer_id, ? as slug, ? as title, ? as company,
+              ? as company_size, ? as city, ? as workplace_type,
+              ? as working_time, ? as experience_level, ? as search_category,
+              ? as published_at,
+              ? as b2b_from, ? as b2b_to, ? as b2b_currency,
+              ? as b2b_unit, ? as b2b_gross,
+              ? as perm_from, ? as perm_to, ? as perm_currency,
+              ? as perm_unit, ? as perm_gross,
+              ? as other_type, ? as other_from, ? as other_to,
+              ? as other_currency, ? as other_unit,
+              ? as required_skills, ? as nice_to_have_skills,
+              ? as url, ? as body_html, ? as scraped_at) AS S
+ON T.url = S.url
+WHEN MATCHED THEN UPDATE SET
+    offer_id = S.offer_id, slug = S.slug, title = S.title,
+    company = S.company, company_size = S.company_size, city = S.city,
+    workplace_type = S.workplace_type, working_time = S.working_time,
+    experience_level = S.experience_level, search_category = S.search_category,
+    published_at = S.published_at,
+    b2b_from = S.b2b_from, b2b_to = S.b2b_to, b2b_currency = S.b2b_currency,
+    b2b_unit = S.b2b_unit, b2b_gross = S.b2b_gross,
+    perm_from = S.perm_from, perm_to = S.perm_to, perm_currency = S.perm_currency,
+    perm_unit = S.perm_unit, perm_gross = S.perm_gross,
+    other_type = S.other_type, other_from = S.other_from, other_to = S.other_to,
+    other_currency = S.other_currency, other_unit = S.other_unit,
+    required_skills = S.required_skills, nice_to_have_skills = S.nice_to_have_skills,
+    body_html = S.body_html, scraped_at = S.scraped_at,
+    created_at = GETDATE()
+WHEN NOT MATCHED THEN INSERT
+    (offer_id, slug, title, company, company_size, city,
+     workplace_type, working_time, experience_level, search_category,
+     published_at,
+     b2b_from, b2b_to, b2b_currency, b2b_unit, b2b_gross,
+     perm_from, perm_to, perm_currency, perm_unit, perm_gross,
+     other_type, other_from, other_to, other_currency, other_unit,
+     required_skills, nice_to_have_skills, url, body_html, scraped_at,
+     first_seen_at)
+    VALUES (S.offer_id, S.slug, S.title, S.company, S.company_size, S.city,
+            S.workplace_type, S.working_time, S.experience_level, S.search_category,
+            S.published_at,
+            S.b2b_from, S.b2b_to, S.b2b_currency, S.b2b_unit, S.b2b_gross,
+            S.perm_from, S.perm_to, S.perm_currency, S.perm_unit, S.perm_gross,
+            S.other_type, S.other_from, S.other_to, S.other_currency, S.other_unit,
+            S.required_skills, S.nice_to_have_skills, S.url, S.body_html, S.scraped_at,
+            GETDATE());
+"""
+
+ALTER_TABLE_SQL = """
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID('justjoin_offers')
+      AND name = 'first_seen_at'
+)
+ALTER TABLE justjoin_offers ADD first_seen_at DATETIME DEFAULT GETDATE();
+"""
 
 
 # --- Utility ---
@@ -81,36 +206,56 @@ def init_session() -> requests.Session:
 def collect_slugs_for_category(
     session: requests.Session,
     category: str,
-) -> tuple[list[str], int]:
+) -> tuple[list[dict], int]:
     """
-    Pobiera liste ofert z API listingowego.
-    GET /api/candidate-api/offers?categories={cat}&from=0&itemsCount=100
+    Pobiera WSZYSTKIE oferty z API listingowego (paginacja).
+    GET /api/candidate-api/offers?categories={cat}&from={offset}&itemsCount=100
 
-    Zwraca: (lista slugow, total dostepnych w kategorii)
+    Zwraca: (lista dict{slug, offer_id}, total dostepnych w kategorii)
+    offer_id = guid z listing API = stabilny UUID oferty.
     """
-    url = f"{API_BASE}?categories={category}&from=0&itemsCount={LISTING_PAGE_SIZE}"
+    results = []
+    seen_ids: set[str] = set()
+    total = 0
+    offset = 0
 
-    try:
-        resp = session.get(url, headers=HEADERS_API, timeout=15)
-        if resp.status_code != 200:
-            print(f"  [BLAD] HTTP {resp.status_code}")
-            return [], 0
+    while True:
+        url = f"{API_BASE}?categories={category}&from={offset}&itemsCount={LISTING_PAGE_SIZE}"
 
-        payload = resp.json()
-        items = payload.get("data", [])
-        total = payload.get("meta", {}).get("totalItems", 0)
+        try:
+            resp = session.get(url, headers=HEADERS_API, timeout=15)
+            if resp.status_code != 200:
+                print(f"  [BLAD] HTTP {resp.status_code} na offset={offset}")
+                break
 
-        slugs = []
-        for item in items:
-            slug = item.get("slug", "")
-            if slug and slug not in slugs:
-                slugs.append(slug)
+            payload = resp.json()
+            items = payload.get("data", [])
+            total = payload.get("meta", {}).get("totalItems", 0)
 
-        return slugs, total
+            if not items:
+                break
 
-    except Exception as e:
-        print(f"  [BLAD] {e}")
-        return [], 0
+            page_new = 0
+            for item in items:
+                slug = item.get("slug", "")
+                offer_id = item.get("guid", "")
+                if slug and offer_id and offer_id not in seen_ids:
+                    seen_ids.add(offer_id)
+                    results.append({"slug": slug, "offer_id": offer_id})
+                    page_new += 1
+
+            offset += LISTING_PAGE_SIZE
+
+            if page_new == 0 or offset >= total:
+                break
+
+            polite_delay(0.5, 1.5)
+
+        except Exception as e:
+            print(f"  [BLAD] {e}")
+            break
+
+    return results, total
 
 
 # --- FAZA 2: Pobieranie szczegulow oferty (REST API) ---
@@ -193,6 +338,7 @@ def _parse_api_offer(raw: dict, slug: str) -> dict:
             })
 
     return {
+        "offer_id":            raw.get("id", ""),
         "slug":                slug,
         "title":               _clean_text(raw.get("title", "")),
         "company":             _clean_text(raw.get("companyName", "")),
@@ -276,7 +422,7 @@ def export_csv(offers: list[dict], filepath: str):
     Oddzielne kolumny salary per typ umowy (b2b, permanent).
     """
     CSV_COLUMNS = [
-        "slug", "title", "company", "company_size", "city",
+        "offer_id", "slug", "title", "company", "company_size", "city",
         "workplace_type", "working_time", "experience_level",
         "search_category", "published_at",
         # B2B salary
@@ -287,7 +433,7 @@ def export_csv(offers: list[dict], filepath: str):
         "other_type", "other_from", "other_to", "other_currency", "other_unit",
         # Skills
         "required_skills", "nice_to_have_skills",
-        "url",
+        "url", "body_html", "scraped_at", "first_seen_at", "created_at",
     ]
 
     with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
@@ -316,6 +462,7 @@ def export_csv(offers: list[dict], filepath: str):
             )
 
             row = {
+                "offer_id":         offer.get("offer_id", ""),
                 "slug":             offer.get("slug", ""),
                 "title":            offer.get("title", ""),
                 "company":          offer.get("company", ""),
@@ -348,18 +495,169 @@ def export_csv(offers: list[dict], filepath: str):
                 "required_skills":     req_skills,
                 "nice_to_have_skills": nice_skills,
                 "url":                 offer.get("url", ""),
+                "body_html":           offer.get("body_html", ""),
+                "scraped_at":          offer.get("scraped_at", ""),
+                "first_seen_at":       offer.get("scraped_at", ""),
+                "created_at":          offer.get("scraped_at", ""),
             }
             writer.writerow(row)
 
     print(f"  CSV zapisano do:   {filepath}")
 
 
-# --- Main ---
+# --- Azure SQL Upload ---
 
-def main():
-    """Glowna funkcja scrapera Premium Selection."""
-    if sys.platform == "win32":
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+def _build_sql_params(offer: dict) -> tuple:
+    """
+    Buduje 31-elementowa krotke parametrow dla MERGE_SQL.
+    Kolejnosc musi odpowiadac ? w MERGE_SQL.
+    """
+    sals = offer.get("salaries", [])
+    b2b = _salary_for_type(sals, "b2b")
+    perm = _salary_for_type(sals, "permanent")
+
+    other = {}
+    for s in sals:
+        if s.get("type") not in ("b2b", "permanent", "unknown"):
+            other = s
+            break
+
+    req_skills = ", ".join(
+        f"{sk['name']}({sk['level']})" for sk in offer.get("required_skills", [])
+    )
+    nice_skills = ", ".join(
+        f"{sk['name']}({sk['level']})" for sk in offer.get("nice_to_have_skills", [])
+    )
+
+    def _s(v):
+        if v is None:
+            return None
+        return str(v).strip() if v != "" else None
+
+    return (
+        _s(offer.get("offer_id")),
+        _s(offer.get("slug")),
+        _s(offer.get("title")),
+        _s(offer.get("company")),
+        _s(offer.get("company_size")),
+        _s(offer.get("city")),
+        _s(offer.get("workplace_type")),
+        _s(offer.get("working_time")),
+        _s(offer.get("experience_level")),
+        _s(offer.get("search_category")),
+        _s(offer.get("published_at")),
+        # B2B
+        _s(b2b.get("salary_from")),
+        _s(b2b.get("salary_to")),
+        _s(b2b.get("currency")),
+        _s(b2b.get("unit")),
+        _s(b2b.get("gross")),
+        # Permanent
+        _s(perm.get("salary_from")),
+        _s(perm.get("salary_to")),
+        _s(perm.get("currency")),
+        _s(perm.get("unit")),
+        _s(perm.get("gross")),
+        # Other
+        _s(other.get("type")),
+        _s(other.get("salary_from")),
+        _s(other.get("salary_to")),
+        _s(other.get("currency")),
+        _s(other.get("unit")),
+        # Skills
+        req_skills or None,
+        nice_skills or None,
+        # url, body_html, scraped_at
+        _s(offer.get("url")),
+        _s(offer.get("body_html")),
+        _s(offer.get("scraped_at")),
+    )
+
+
+def upload_to_azure_sql(offers: list[dict]) -> dict:
+    """
+    Wysyla oferty do Azure SQL (tabela justjoin_offers).
+    Uzywa MERGE (upsert) po kluczu url - bezpieczne wielokrotne uruchomienie.
+
+    Zwraca dict: {"uploaded": int, "errors": list[str]}
+    """
+    import pyodbc
+
+    result = {"uploaded": 0, "errors": []}
+
+    conn_str = os.environ.get("SqlConnectionString")
+    if not conn_str:
+        msg = "Brak SqlConnectionString w zmiennych srodowiskowych (.env)"
+        print(f"  [SQL] {msg}")
+        result["errors"].append(msg)
+        return result
+
+    print(f"\n[SQL] Laczenie z Azure SQL...")
+
+    max_retries = 3
+    conn = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            conn = pyodbc.connect(conn_str, timeout=60)
+            print(f"  [SQL] Polaczono (proba {attempt}/{max_retries})")
+            break
+        except pyodbc.Error as e:
+            if attempt < max_retries:
+                wait = attempt * 15
+                print(f"  [SQL] Baza niedostepna (proba {attempt}/{max_retries}), czekam {wait}s...")
+                time.sleep(wait)
+            else:
+                msg = f"Blad polaczenia z Azure SQL po {max_retries} probach: {e}"
+                print(f"  [SQL] {msg}")
+                result["errors"].append(msg)
+                return result
+
+    try:
+        with conn:
+            cursor = conn.cursor()
+
+            cursor.execute(CREATE_TABLE_SQL)
+            cursor.execute(ALTER_TABLE_SQL)
+            conn.commit()
+            print("  [SQL] Tabela justjoin_offers - OK")
+
+            uploaded = 0
+            for i, offer in enumerate(offers):
+                params = _build_sql_params(offer)
+                try:
+                    cursor.execute(MERGE_SQL, *params)
+                    uploaded += 1
+                except Exception as e:
+                    err = f"Wiersz {i} ({offer.get('url', '?')}): {e}"
+                    print(f"  [SQL] BLAD: {err}")
+                    result["errors"].append(err)
+
+            conn.commit()
+            result["uploaded"] = uploaded
+            print(f"  [SQL] Upload zakonczony: {uploaded}/{len(offers)} ofert")
+
+    except pyodbc.Error as e:
+        msg = f"Blad SQL: {e}"
+        print(f"  [SQL] {msg}")
+        result["errors"].append(msg)
+
+    return result
+
+
+# --- Main pipeline ---
+
+def run() -> dict:
+    """
+    Glowna logika scrapera. Zwraca result dict kompatybilny z scraper_monitor.
+    """
+    result = {
+        "success": False,
+        "total_offers": 0,
+        "categories_ok": [],
+        "categories_empty": [],
+        "errors": [],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
     print("=" * 65)
     print("  JustJoin.it  Premium Selection Scraper")
@@ -376,37 +674,41 @@ def main():
 
     # ---- FAZA 1: Zbieranie slugow ----
     print("\n[FAZA 1] Zbieranie listy ofert z kazdej kategorii...\n")
-    category_slugs: dict[str, list[str]] = {}
-    seen_slugs: set[str] = set()
+    category_items: dict[str, list[dict]] = {}
+    seen_ids: set[str] = set()
 
     for cat in CATEGORIES:
-        slugs, total = collect_slugs_for_category(session, cat)
+        items, total = collect_slugs_for_category(session, cat)
 
-        # Deduplikacja miedzy kategoriami
-        unique = [s for s in slugs if s not in seen_slugs]
-        seen_slugs.update(unique)
-        category_slugs[cat] = unique
+        # Deduplikacja miedzy kategoriami po offer_id (stabilny UUID)
+        unique = [it for it in items if it["offer_id"] not in seen_ids]
+        seen_ids.update(it["offer_id"] for it in unique)
+        category_items[cat] = unique
 
-        print(f"  {cat.upper():12s}  pobrano {len(unique):>4d} slugow"
+        print(f"  {cat.upper():12s}  pobrano {len(unique):>4d} ofert"
               f"  (total w kategorii: {total})")
         polite_delay(1.0, 2.0)
 
-    grand_total = sum(len(v) for v in category_slugs.values())
+    grand_total = sum(len(v) for v in category_items.values())
     print(f"\n  Lacznie: {grand_total} unikalnych ofert do Deep Dive")
+
+    if grand_total == 0:
+        result["errors"].append("API zwrocilo 0 ofert we wszystkich kategoriach!")
+        return result
 
     # ---- FAZA 2: Deep Dive (tylko PL) ----
     print("\n[FAZA 2] Pobieranie szczegolow ofert (REST API, filtr: PL)...\n")
     all_offers: list[dict] = []
     stats: dict[str, int] = {}
     processed = 0
-    skipped_non_pl = 0
     errors = 0
 
-    for cat, slugs in category_slugs.items():
-        print(f"  --- {cat.upper()} ({len(slugs)} ofert) ---")
+    for cat, items in category_items.items():
+        print(f"  --- {cat.upper()} ({len(items)} ofert) ---")
         cat_offers = []
 
-        for slug in slugs:
+        for item in items:
+            slug = item["slug"]
             processed += 1
             short = slug[:45] + ("..." if len(slug) > 45 else "")
             print(f"    [{processed:3d}/{grand_total}] {short:50s}", end="  ")
@@ -426,12 +728,13 @@ def main():
 
         all_offers.extend(cat_offers)
         stats[cat] = len(cat_offers)
-        print(f"  -> Pobrano: {len(cat_offers)}/{len(slugs)}\n")
+        print(f"  -> Pobrano: {len(cat_offers)}/{len(items)}\n")
 
     # ---- FAZA 3: Zapis ----
     if not all_offers:
         print("\n[FAIL] Nie udalo sie pobrac zadnych ofert.")
-        return
+        result["errors"].append("Pobrano 0 ofert po filtrze PL!")
+        return result
 
     output = {
         "metadata": {
@@ -452,6 +755,12 @@ def main():
     # ---- CSV Export ----
     export_csv(all_offers, CSV_FILE)
 
+    # ---- Upload do Azure SQL ----
+    sql_result = upload_to_azure_sql(all_offers)
+    result["sql_uploaded"] = sql_result["uploaded"]
+    if sql_result["errors"]:
+        result["errors"].extend(sql_result["errors"])
+
     # ---- Podsumowanie ----
     print("=" * 65)
     print("  PODSUMOWANIE")
@@ -470,6 +779,47 @@ def main():
     display_sample_offer(sample)
 
     print(f"\n[SUCCESS] Scraping zakonczony pomyslnie!")
+
+    # ---- Build monitor result ----
+    result["success"] = True
+    result["total_offers"] = len(all_offers)
+    for cat in CATEGORIES:
+        if stats.get(cat, 0) > 0:
+            result["categories_ok"].append(cat)
+        else:
+            result["categories_empty"].append(cat)
+
+    return result
+
+
+def main():
+    """Entry point: run scraper z monitoringiem."""
+    if sys.platform == "win32":
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+    # Lokalny _load_env() — scraper dziala niezaleznie od pracuj_scraper
+    _load_env()
+
+    try:
+        result = run()
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"\n[MONITOR] Scraper rzucil wyjatek:\n{tb}")
+        result = {
+            "success": False,
+            "total_offers": 0,
+            "categories_ok": [],
+            "categories_empty": [],
+            "errors": [f"Nieobsluzony wyjatek: {e}"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # Opcjonalny monitoring — nie blokuje jesli pracuj_scraper niedostepny
+    try:
+        from pracuj_scraper.scraper_monitor import monitor_scraper
+        monitor_scraper("JustJoin.it", result)
+    except ImportError:
+        print("  [INFO] scraper_monitor niedostepny - pomijam monitoring email")
 
 
 if __name__ == "__main__":

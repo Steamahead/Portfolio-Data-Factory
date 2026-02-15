@@ -493,7 +493,7 @@ class PSEConnector:
         """
         logging.info(f"    → balancing_settlement ({endpoint})")
 
-        # DDL - tworzymy tabelę jeśli nie istnieje
+        # DDL - tworzymy tabelę jeśli nie istnieje (commit osobno aby MERGE widział schemat)
         cursor.execute("""
         IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'balancing_settlement')
         CREATE TABLE balancing_settlement (
@@ -502,30 +502,26 @@ class PSEConnector:
             period              NVARCHAR(20)   NULL,
             dtime_utc           DATETIME2      NULL,
             period_utc          NVARCHAR(20)   NULL,
-            -- crb-rozl
             cen_cost            DECIMAL(18,5)  NULL,
             ckoeb_cost          DECIMAL(18,5)  NULL,
             ceb_pp_cost         DECIMAL(18,5)  NULL,
             ceb_sr_cost         DECIMAL(18,5)  NULL,
             ceb_sr_afrrd_cost   DECIMAL(18,5)  NULL,
             ceb_sr_afrrg_cost   DECIMAL(18,5)  NULL,
-            -- eb-rozl
             eb_d_pp             DECIMAL(18,5)  NULL,
             eb_w_pp             DECIMAL(18,5)  NULL,
             eb_afrrd            DECIMAL(18,5)  NULL,
             eb_afrrg            DECIMAL(18,5)  NULL,
-            -- en-rozl
             en_d                DECIMAL(18,5)  NULL,
             en_w                DECIMAL(18,5)  NULL,
             balance             DECIMAL(18,5)  NULL,
-            -- ro-rozl
             ro_cost             DECIMAL(18,5)  NULL,
-            -- audit
             created_at          DATETIME2      DEFAULT GETUTCDATE(),
             updated_at          DATETIME2      DEFAULT GETUTCDATE(),
             CONSTRAINT PK_balancing_settlement PRIMARY KEY (business_date, dtime)
         );
         """)
+        cursor.connection.commit()
 
         # Mapowanie endpoint → kolumny do upsert
         column_map = {
