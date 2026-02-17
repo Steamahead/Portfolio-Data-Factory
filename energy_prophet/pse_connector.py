@@ -58,7 +58,7 @@ class PSEConnector:
             "User-Agent": "EnergyProphet/1.0"
         })
 
-    def _connect_with_retry(self, conn_str: str, max_retries: int = 3):
+    def _connect_with_retry(self, conn_str: str, max_retries: int = 5):
         """Połączenie SQL z retry logic i Connection Timeout."""
         import time
         for attempt in range(max_retries):
@@ -69,7 +69,7 @@ class PSEConnector:
                 return pyodbc.connect(cs)
             except Exception as e:
                 if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 5
+                    wait_time = (attempt + 1) * 10
                     logging.warning(f"  ⚠️ SQL connection failed. Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries}): {e}")
                     time.sleep(wait_time)
                 else:

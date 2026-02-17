@@ -245,6 +245,77 @@ def build_success_summary(scraper_name: str, result: dict) -> str:
     return f"[OK] {scraper_name}: {total} ofert, {cats} kategorii"
 
 
+def build_daily_report_html(results: dict, history: list[dict]) -> str:
+    """Buduje HTML z codziennym raportem podsumowującym wszystkie scrapery."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    all_ok = all(r.get("success") for r in results.values())
+    status_color = "#28a745" if all_ok else "#dc3545"
+    status_icon = "✅" if all_ok else "⚠️"
+    status_text = "Wszystko OK" if all_ok else "Wykryto problemy"
+
+    rows = ""
+    total_all = 0
+    for name, r in results.items():
+        ok = r.get("success", False)
+        total = r.get("total_offers", 0)
+        total_all += total
+        icon = "✅" if ok else "❌"
+        color = "#28a745" if ok else "#dc3545"
+
+        # Porównanie z poprzednim runem
+        last = get_last_successful_run(
+            [h for h in history if h.get("scraper") == name and h.get("timestamp") != r.get("timestamp")],
+            name
+        )
+        if last and last.get("total_offers", 0) > 0:
+            prev = last["total_offers"]
+            diff = total - prev
+            diff_str = f"+{diff}" if diff >= 0 else str(diff)
+            diff_color = "#28a745" if diff >= 0 else "#dc3545"
+            trend = f' <span style="color:{diff_color};font-size:12px;">({diff_str} vs poprzedni)</span>'
+        else:
+            trend = ""
+
+        cats_ok = ", ".join(r.get("categories_ok", [])) or "—"
+        errors = "; ".join(r.get("errors", [])) or "—"
+        error_row = "" if ok else f'<tr><td colspan="2" style="color:#dc3545;font-size:12px;padding:2px 8px;">&#9888; {errors}</td></tr>'
+
+        rows += f"""
+        <tr style="border-top:1px solid #eee;">
+          <td style="padding:8px;font-weight:bold;">{icon} {name}</td>
+          <td style="padding:8px;color:{color};">{total} ofert{trend}</td>
+        </tr>
+        <tr>
+          <td style="padding:2px 8px;color:gray;font-size:12px;" colspan="2">Kategorie: {cats_ok}</td>
+        </tr>
+        {error_row}
+        """
+
+    html = f"""
+    <html><body style="font-family:Segoe UI,Arial,sans-serif;max-width:600px;color:#333;">
+    <h2 style="color:{status_color};">{status_icon} Daily Report — {ts}</h2>
+    <p style="color:gray;">Portfolio Data Factory · Scrapers Summary</p>
+
+    <table style="border-collapse:collapse;width:100%;background:#f9f9f9;border-radius:4px;">
+      {rows}
+      <tr style="border-top:2px solid #ccc;background:#fff;">
+        <td style="padding:8px;font-weight:bold;">ŁĄCZNIE</td>
+        <td style="padding:8px;font-weight:bold;">{total_all} ofert</td>
+      </tr>
+    </table>
+
+    <p style="margin-top:16px;color:{'#28a745' if all_ok else '#dc3545'};font-weight:bold;">{status_text}</p>
+
+    <hr>
+    <p style="color:gray;font-size:12px;">
+      Portfolio Data Factory — Scraper Monitor<br>
+      Raport wygenerowany automatycznie · {ts}
+    </p>
+    </body></html>
+    """
+    return html
+
+
 # --- Runner ---
 
 def run_pracuj(dry_run: bool = False) -> dict:
@@ -445,6 +516,19 @@ def main():
         print("\n  Wszystko działa poprawnie.")
     else:
         print("\n  Wykryto problemy - sprawdź alerty powyżej.")
+
+    # --- Wyślij dzienny raport podsumowujący ---
+    if not args.dry_run and results:
+        email_config = get_email_config()
+        if email_config:
+            history = load_history()
+            status_label = "SUCCESS" if all_ok else "FAILURE"
+            subject = f"[{status_label}] Daily Report {datetime.now().strftime('%Y-%m-%d')} — Portfolio Data Factory"
+            body = build_daily_report_html(results, history)
+            send_email(subject, body, email_config)
+        else:
+            print("\n  [MONITOR] Brak konfiguracji email - nie wysłano raportu dziennego.")
+            print("  Skonfiguruj ALERT_EMAIL_FROM/PASSWORD/TO w pliku .env")
 
     sys.exit(0 if all_ok else 1)
 

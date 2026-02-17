@@ -140,7 +140,7 @@ class WeatherConnector:
             return pd.DataFrame()
         return pd.DataFrame(all_data)
 
-    def _connect_with_retry(self, max_retries=3):
+    def _connect_with_retry(self, max_retries=5):
         """Połączenie SQL z retry logic."""
         for attempt in range(max_retries):
             try:
@@ -150,7 +150,7 @@ class WeatherConnector:
                 return pyodbc.connect(conn_str)
             except Exception as e:
                 if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 5
+                    wait_time = (attempt + 1) * 10
                     logging.warning(f"   ⚠️ SQL connection failed. Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries}): {e}")
                     time.sleep(wait_time)
                 else:
