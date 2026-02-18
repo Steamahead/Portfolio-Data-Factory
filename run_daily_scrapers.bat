@@ -15,8 +15,9 @@ chcp 65001 > nul
 :: Przygotuj folder logow
 if not exist "logs" mkdir logs
 
-:: Nazwa pliku logu z dzisiejsza data
-set "LOG_FILE=logs\scrapers_%date:~6,4%-%date:~3,2%-%date:~0,2%.log"
+:: Nazwa pliku logu z dzisiejsza data (PowerShell - niezalezne od ustawien regionalnych)
+for /f %%d in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd"') do set "TODAY=%%d"
+set "LOG_FILE=logs\scrapers_%TODAY%.log"
 
 echo ============================================================ >> "%LOG_FILE%"
 echo  Portfolio Data Factory - Daily Run >> "%LOG_FILE%"
@@ -33,8 +34,8 @@ if not exist ".venv\Scripts\python.exe" (
 :: Zapobiegaj usypianiu laptopa podczas scrapowania
 :: powercfg /change ustawia timeout uśpienia na 0 (nigdy) na czas działania
 :: ac = zasilanie sieciowe, dc = bateria
-for /f "tokens=4" %%a in ('powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE ^| findstr "Current AC"') do set "SLEEP_AC=%%a"
-for /f "tokens=4" %%a in ('powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE ^| findstr "Current DC"') do set "SLEEP_DC=%%a"
+for /f %%a in ('powershell -NoProfile -Command "(powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE | Select-String \"Current AC\") -replace \".*0x\",\"\" | ForEach-Object {[int]([Convert]::ToInt32($_.Trim(),16)/60)}"') do set "SLEEP_AC=%%a"
+for /f %%a in ('powershell -NoProfile -Command "(powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE | Select-String \"Current DC\") -replace \".*0x\",\"\" | ForEach-Object {[int]([Convert]::ToInt32($_.Trim(),16)/60)}"') do set "SLEEP_DC=%%a"
 powercfg /change standby-timeout-ac 0 > nul
 powercfg /change standby-timeout-dc 0 > nul
 echo [INFO] Uśpienie tymczasowo wyłączone (AC=%SLEEP_AC%, DC=%SLEEP_DC%) >> "%LOG_FILE%"

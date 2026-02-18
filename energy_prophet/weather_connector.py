@@ -160,7 +160,6 @@ class WeatherConnector:
         if df.empty:
             return
 
-        # DDL - Enhanced table for Power BI visualization
         create_table_sql = """
         IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'weather_data')
         CREATE TABLE weather_data (
@@ -182,7 +181,6 @@ class WeatherConnector:
         );
         """
 
-        # UPSERT with new columns
         merge_sql = """
         MERGE INTO weather_data AS T
         USING (SELECT ? as loc, ? as loc_type, ? as dt, ? as biz_date, ? as hr,
@@ -200,28 +198,41 @@ class WeatherConnector:
                     S.tmp, S.wnd, S.wnd_dir, S.sol, S.cld);
         """
 
-        with self._connect_with_retry() as conn:
-            cursor = conn.cursor()
-            cursor.execute(create_table_sql)
-            conn.commit()
+        # Retry na cały blok SQL (connect + execute + commit)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                with self._connect_with_retry() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(create_table_sql)
+                    conn.commit()
 
-            for _, r in df.iterrows():
-                dtime_val = r['dtime'].to_pydatetime()
-                vals = [
-                    r['location'],
-                    r['location_type'],
-                    dtime_val,
-                    r['business_date'],
-                    r['hour'],
-                    r['lat'],
-                    r['lon'],
-                    r['temp_c'],
-                    r['wind_kph'],
-                    r['wind_direction'],
-                    r['solar_rad'],
-                    r['cloud_cover']
-                ]
-                vals = [None if pd.isna(v) else v for v in vals]
+                    for _, r in df.iterrows():
+                        dtime_val = r['dtime'].to_pydatetime()
+                        vals = [
+                            r['location'],
+                            r['location_type'],
+                            dtime_val,
+                            r['business_date'],
+                            r['hour'],
+                            r['lat'],
+                            r['lon'],
+                            r['temp_c'],
+                            r['wind_kph'],
+                            r['wind_direction'],
+                            r['solar_rad'],
+                            r['cloud_cover']
+                        ]
+                        vals = [None if pd.isna(v) else v for v in vals]
 
-                cursor.execute(merge_sql, *vals)
-            conn.commit()
+                        cursor.execute(merge_sql, *vals)
+                    conn.commit()
+                    break  # sukces
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 15
+                    logging.warning(f"   ⚠️ Weather SQL batch failed. Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(wait_time)
+                else:
+                    raise

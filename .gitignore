@@ -15,8 +15,7 @@ __pycache__/
 *.log
 *.csv
 *.xlsx
-nul
-*/nul
+
 
 # --- IDE (PyCharm / VS Code) ---
 .idea/

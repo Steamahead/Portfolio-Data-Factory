@@ -1,5 +1,6 @@
 .venv
 .git
+nul
 .idea
 .vscode
 .claude
@@ -9,9 +10,11 @@ debug_data
 nfj_scraper
 pracuj_scraper
 just_join_scraper
+logs
 nul
 *.html
 *.txt
+!requirements.txt
 *.json
 !host.json
 !*/function.json

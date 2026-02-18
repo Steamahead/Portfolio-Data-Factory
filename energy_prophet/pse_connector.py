@@ -90,47 +90,53 @@ class PSEConnector:
         except (ValueError, TypeError):
             return None
 
-    def _fetch(self, endpoint: str, date_str: str) -> Optional[pd.DataFrame]:
-        """Pobiera dane z endpointu PSE API z obsługą paginacji (nextLink)."""
-        url = f"{self.base_url}/{endpoint}"
-        params = {"$filter": f"business_date eq '{date_str}'"}
+    def _fetch(self, endpoint: str, date_str: str, max_retries: int = 3) -> Optional[pd.DataFrame]:
+        """Pobiera dane z endpointu PSE API z obsługą paginacji (nextLink) i retry."""
+        import time as _time
 
-        all_records = []
-        page = 1
+        for attempt in range(max_retries):
+            url = f"{self.base_url}/{endpoint}"
+            params = {"$filter": f"business_date eq '{date_str}'"}
 
-        try:
-            while url:
-                if page == 1:
-                    resp = self.session.get(url, params=params, timeout=self.timeout)
+            all_records = []
+            page = 1
+
+            try:
+                while url:
+                    if page == 1:
+                        resp = self.session.get(url, params=params, timeout=self.timeout)
+                    else:
+                        resp = self.session.get(url, timeout=self.timeout)
+
+                    resp.raise_for_status()
+                    data = resp.json()
+                    records = data.get("value", []) if isinstance(data, dict) else data
+
+                    if records:
+                        all_records.extend(records)
+
+                    next_link = data.get("nextLink") if isinstance(data, dict) else None
+                    if next_link:
+                        url = next_link
+                        page += 1
+                    else:
+                        url = None
+
+                if all_records:
+                    logging.info(f"  ✓ {endpoint}: {len(all_records)} rows" + (f" ({page} pages)" if page > 1 else ""))
+                    return pd.DataFrame(all_records)
+
+                logging.warning(f"  ⚠ {endpoint}: empty")
+                return pd.DataFrame()
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5
+                    logging.warning(f"  ⚠️ {endpoint}: fetch failed. Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries}): {e}")
+                    _time.sleep(wait_time)
                 else:
-                    # nextLink contains full URL with params
-                    resp = self.session.get(url, timeout=self.timeout)
-
-                resp.raise_for_status()
-                data = resp.json()
-                records = data.get("value", []) if isinstance(data, dict) else data
-
-                if records:
-                    all_records.extend(records)
-
-                # Check for pagination
-                next_link = data.get("nextLink") if isinstance(data, dict) else None
-                if next_link:
-                    url = next_link
-                    page += 1
-                else:
-                    url = None
-
-            if all_records:
-                logging.info(f"  ✓ {endpoint}: {len(all_records)} rows" + (f" ({page} pages)" if page > 1 else ""))
-                return pd.DataFrame(all_records)
-
-            logging.warning(f"  ⚠ {endpoint}: empty")
-            return pd.DataFrame()
-
-        except Exception as e:
-            logging.error(f"  ✗ {endpoint}: {e}")
-            return None
+                    logging.error(f"  ✗ {endpoint}: failed after {max_retries} attempts: {e}")
+                    return None
 
     def run_etl(self, run_date: datetime.date):
         """Główna funkcja ETL."""
@@ -164,60 +170,69 @@ class PSEConnector:
             if not raw:
                 continue
 
-            # Upload do SQL
-            try:
-                with self._connect_with_retry(conn_str) as conn:
-                    cursor = conn.cursor()
+            # Upload do SQL (z retry na cały blok connect+execute+commit)
+            import time as _time
+            max_sql_retries = 3
+            for sql_attempt in range(max_sql_retries):
+                try:
+                    with self._connect_with_retry(conn_str) as conn:
+                        cursor = conn.cursor()
 
-                    # 1. ENERGY_PRICES
-                    if 'rce-pln' in raw:
-                        self._upsert_prices(cursor, raw['rce-pln'])
+                        # 1. ENERGY_PRICES
+                        if 'rce-pln' in raw:
+                            self._upsert_prices(cursor, raw['rce-pln'])
 
-                    # 2. GENERATION_MIX (merged)
-                    self._upsert_generation_mix(
-                        cursor,
-                        actuals=raw.get('his-wlk-cal'),
-                        load_fcst=raw.get('kse-load'),
-                        oze_fcst=raw.get('pk5l-wp')
-                    )
+                        # 2. GENERATION_MIX (merged)
+                        self._upsert_generation_mix(
+                            cursor,
+                            actuals=raw.get('his-wlk-cal'),
+                            load_fcst=raw.get('kse-load'),
+                            oze_fcst=raw.get('pk5l-wp')
+                        )
 
-                    # 3. POWER_BALANCE (merged)
-                    self._upsert_power_balance(
-                        cursor,
-                        reserves=raw.get('his-bil-mocy'),
-                        daily_plan=raw.get('pdgopkd')
-                    )
+                        # 3. POWER_BALANCE (merged)
+                        self._upsert_power_balance(
+                            cursor,
+                            reserves=raw.get('his-bil-mocy'),
+                            daily_plan=raw.get('pdgopkd')
+                        )
 
-                    # 4. CROSS_BORDER_FLOWS
-                    if 'przeplywy-mocy' in raw:
-                        self._upsert_flows(cursor, raw['przeplywy-mocy'])
+                        # 4. CROSS_BORDER_FLOWS
+                        if 'przeplywy-mocy' in raw:
+                            self._upsert_flows(cursor, raw['przeplywy-mocy'])
 
-                    # 5. PSE_ALERTS
-                    if 'pdgsz' in raw:
-                        self._upsert_alerts(cursor, raw['pdgsz'])
+                        # 5. PSE_ALERTS
+                        if 'pdgsz' in raw:
+                            self._upsert_alerts(cursor, raw['pdgsz'])
 
-                    # 6. OZE_CURTAILMENT
-                    if 'poze-redoze' in raw:
-                        self._upsert_curtailment(cursor, raw['poze-redoze'])
+                        # 6. OZE_CURTAILMENT
+                        if 'poze-redoze' in raw:
+                            self._upsert_curtailment(cursor, raw['poze-redoze'])
 
-                    # 7. CO2_PRICES
-                    if 'rcco2' in raw:
-                        self._upsert_co2(cursor, raw['rcco2'])
+                        # 7. CO2_PRICES
+                        if 'rcco2' in raw:
+                            self._upsert_co2(cursor, raw['rcco2'])
 
-                    # 8. SETTLEMENT (D+7)
-                    for ep in ['crb-rozl', 'eb-rozl', 'en-rozl', 'ro-rozl']:
-                        if ep in raw:
-                            self._upsert_settlement(cursor, raw[ep], ep)
+                        # 8. SETTLEMENT (D+7)
+                        for ep in ['crb-rozl', 'eb-rozl', 'en-rozl', 'ro-rozl']:
+                            if ep in raw:
+                                self._upsert_settlement(cursor, raw[ep], ep)
 
-                    # 9. PLANNED OUTAGES
-                    if 'unav-pk5l' in raw:
-                            self._upsert_outages(cursor, raw['unav-pk5l'])
+                        # 9. PLANNED OUTAGES
+                        if 'unav-pk5l' in raw:
+                                self._upsert_outages(cursor, raw['unav-pk5l'])
 
-                    conn.commit()
-                    logging.info(f"  ✅ Committed")
+                        conn.commit()
+                        logging.info(f"  ✅ Committed")
+                        break  # sukces
 
-            except Exception as e:
-                logging.error(f"  ❌ SQL Error: {e}")
+                except Exception as e:
+                    if sql_attempt < max_sql_retries - 1:
+                        wait_time = (sql_attempt + 1) * 15
+                        logging.warning(f"  ⚠️ SQL batch failed. Retrying in {wait_time}s... (Attempt {sql_attempt + 1}/{max_sql_retries}): {e}")
+                        _time.sleep(wait_time)
+                    else:
+                        logging.error(f"  ❌ SQL batch failed after {max_sql_retries} attempts: {e}")
 
     # =========================================================================
     # UPSERT FUNCTIONS

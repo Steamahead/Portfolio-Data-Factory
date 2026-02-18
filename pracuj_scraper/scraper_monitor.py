@@ -63,6 +63,9 @@ SMTP_PORT = 587
 MIN_TOTAL_OFFERS = 5          # minimum ofert łącznie
 MIN_OFFERS_PER_CATEGORY = 1   # minimum ofert per kategoria
 
+# Scrapery wymagane w każdym daily run - brak któregoś → ostrzeżenie w raporcie
+EXPECTED_SCRAPERS = ["NoFluffJobs", "JustJoin.it", "Pracuj.pl"]
+
 
 def load_env():
     """Ładuje zmienne z .env jeśli plik istnieje."""
@@ -246,21 +249,70 @@ def build_success_summary(scraper_name: str, result: dict) -> str:
 
 
 def build_daily_report_html(results: dict, history: list[dict]) -> str:
-    """Buduje HTML z codziennym raportem podsumowującym wszystkie scrapery."""
+    """Buduje HTML z codziennym raportem podsumowującym wszystkie scrapery.
+
+    Zawsze pokazuje wszystkie EXPECTED_SCRAPERS — nawet te, które nie były częścią
+    bieżącego runu. Dla brakujących szuka w historii dnia; jeśli brak → "NIE URUCHOMIONY".
+    """
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    all_ok = all(r.get("success") for r in results.values())
+    today_date = datetime.now().strftime("%Y-%m-%d")
+
+    # Indeks historii dzisiejszego dnia: {scraper_name: [entries]}
+    today_history: dict[str, list[dict]] = {}
+    for h in history:
+        name = h.get("scraper", "")
+        ts_h = h.get("timestamp", "")
+        if name and (ts_h or "").startswith(today_date):
+            today_history.setdefault(name, []).append(h)
+
+    # Połącz bieżący run z brakującymi z historii / brakującymi zupełnie
+    all_scraper_rows: list[tuple[str, dict, str]] = []  # (name, result_dict, source)
+    for name in EXPECTED_SCRAPERS:
+        if name in results:
+            all_scraper_rows.append((name, results[name], "current"))
+        elif name in today_history:
+            # Weź ostatni run z dzisiaj
+            last_today = today_history[name][-1]
+            all_scraper_rows.append((name, last_today, "history"))
+        else:
+            all_scraper_rows.append((name, {}, "missing"))
+
+    # Czy wszystko OK (brak brakujących i brak błędów)
+    all_ok = all(
+        source != "missing" and r.get("success", False)
+        for _, r, source in all_scraper_rows
+    )
     status_color = "#28a745" if all_ok else "#dc3545"
     status_icon = "✅" if all_ok else "⚠️"
     status_text = "Wszystko OK" if all_ok else "Wykryto problemy"
 
     rows = ""
     total_all = 0
-    for name, r in results.items():
+    for name, r, source in all_scraper_rows:
+        if source == "missing":
+            rows += f"""
+        <tr style="border-top:1px solid #eee;">
+          <td style="padding:8px;font-weight:bold;">&#9888; {name}</td>
+          <td style="padding:8px;color:#dc3545;font-weight:bold;">NIE URUCHOMIONY DZISIAJ</td>
+        </tr>
+        <tr>
+          <td style="padding:2px 8px;color:#dc3545;font-size:12px;" colspan="2">
+            Scraper nie uruchomił się w dniu {today_date}. Sprawdź Task Scheduler lub uruchom ręcznie.
+          </td>
+        </tr>
+        """
+            continue
+
         ok = r.get("success", False)
         total = r.get("total_offers", 0)
         total_all += total
         icon = "✅" if ok else "❌"
         color = "#28a745" if ok else "#dc3545"
+
+        source_label = ""
+        if source == "history":
+            run_ts = r.get("timestamp", "?")[:16].replace("T", " ")
+            source_label = f' <span style="color:#888;font-size:11px;">(run z {run_ts})</span>'
 
         # Porównanie z poprzednim runem
         last = get_last_successful_run(
@@ -282,7 +334,7 @@ def build_daily_report_html(results: dict, history: list[dict]) -> str:
 
         rows += f"""
         <tr style="border-top:1px solid #eee;">
-          <td style="padding:8px;font-weight:bold;">{icon} {name}</td>
+          <td style="padding:8px;font-weight:bold;">{icon} {name}{source_label}</td>
           <td style="padding:8px;color:{color};">{total} ofert{trend}</td>
         </tr>
         <tr>
@@ -512,6 +564,18 @@ def main():
             all_ok = False
         print(f"  {name:20s} [{status}] {r.get('total_offers', 0)} ofert")
 
+    # Sprawdź czy wszystkie oczekiwane scrapery uruchomiono dzisiaj
+    today_date = datetime.now().strftime("%Y-%m-%d")
+    history_for_check = load_history()
+    today_ran = {
+        h["scraper"] for h in history_for_check
+        if (h.get("timestamp", "") or "").startswith(today_date)
+    }
+    missing_scrapers = [s for s in EXPECTED_SCRAPERS if s not in today_ran]
+    if missing_scrapers:
+        all_ok = False
+        print(f"\n  [MONITOR] UWAGA: nie uruchomiono dzisiaj: {', '.join(missing_scrapers)}")
+
     if all_ok:
         print("\n  Wszystko działa poprawnie.")
     else:
@@ -521,10 +585,9 @@ def main():
     if not args.dry_run and results:
         email_config = get_email_config()
         if email_config:
-            history = load_history()
             status_label = "SUCCESS" if all_ok else "FAILURE"
             subject = f"[{status_label}] Daily Report {datetime.now().strftime('%Y-%m-%d')} — Portfolio Data Factory"
-            body = build_daily_report_html(results, history)
+            body = build_daily_report_html(results, history_for_check)
             send_email(subject, body, email_config)
         else:
             print("\n  [MONITOR] Brak konfiguracji email - nie wysłano raportu dziennego.")
