@@ -392,7 +392,7 @@ def parse_detail_page(nd: dict, category: str, url: str) -> dict:
 
     # --- Published At ---
     pub = offer.get("publicationDetails", {})
-    published_at = pub.get("lastPublicatedUtc", "")
+    published_at = pub.get("lastPublishedUtc", "")
 
     # --- Leading Category (Pracuj.pl own categorization) ---
     leading_cat = attrs.get("leadingCategory", {})
