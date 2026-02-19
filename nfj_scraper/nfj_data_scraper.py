@@ -333,15 +333,32 @@ def _format_salary(salary_data: dict) -> str | None:
 
 
 def _build_work_mode(posting: dict) -> str:
-    """Determine work mode: Remote / Hybrid / Office."""
-    location = posting.get("location_detail") or posting.get("location", {})
-    fully_remote = location.get("fullyRemote", False)
-    if fully_remote:
+    """Determine work mode: Remote / Hybrid / Office.
+
+    Checks multiple sources because Listing API uses ``fullyRemote`` (bool)
+    while Detail API uses ``location.remote`` (int, e.g. 100 = fully remote).
+    """
+    location_detail = posting.get("location_detail") or {}
+    location_listing = posting.get("location", {})
+
+    # 1. Listing API top-level flag (most reliable)
+    if posting.get("fullyRemote", False):
         return "Remote"
-    hybrid = location.get("hybridDesc") or ""
-    remote_val = location.get("remote")
-    if hybrid or (remote_val and remote_val not in (0, False, None)):
+    # 2. Listing API location.fullyRemote
+    if location_listing.get("fullyRemote", False):
+        return "Remote"
+    # 3. Detail API location.remote (int: 0 = office, 100 = fully remote)
+    remote_int = location_detail.get("remote")
+    if remote_int is not None and remote_int >= 100:
+        return "Remote"
+
+    # Hybrid: hybridDesc present or partial remote
+    hybrid = location_detail.get("hybridDesc") or location_listing.get("hybridDesc") or ""
+    if hybrid:
         return "Hybrid"
+    if remote_int and remote_int not in (0, False, None):
+        return "Hybrid"
+
     return "Office"
 
 
