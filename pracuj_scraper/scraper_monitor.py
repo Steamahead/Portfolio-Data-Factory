@@ -671,13 +671,19 @@ def show_status():
 
     current = data.get("current_scraper")
     if current and status == "running":
-        phase = data.get("phase", "?")
-        progress = data.get("progress", "?")
-        percent = data.get("percent", 0)
-        eta = data.get("eta", "?")
+        phase = data.get("phase") or "starting"
+        progress = data.get("progress")
+        eta = data.get("eta")
         scraper_idx = data.get("scraper_index", "?")
         scrapers_total = data.get("scrapers_total", "?")
-        print(f"  [>>] {current:15s} {phase} {progress} ({percent}%)  ETA: {eta}")
+
+        if phase == "starting" or not progress:
+            print(f"  [>>] {current:15s} uruchamianie...")
+        else:
+            percent = data.get("percent", 0)
+            eta_str = eta if eta else "obliczanie..."
+            print(f"  [>>] {current:15s} {phase} {progress} ({percent}%)  ETA: {eta_str}")
+
         print(f"\n  Scraper {scraper_idx}/{scrapers_total}")
 
     if status == "finished":
