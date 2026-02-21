@@ -13,14 +13,14 @@ Wykrywa:
 Powiadomienia:
   Gmail SMTP z App Password. Konfiguracja w .env lub zmiennych środowiskowych.
 
-Użycie:
-  python scraper_monitor.py                  # uruchom wszystkie scrapery
-  python scraper_monitor.py --test-email     # wyślij testowego maila
-  python scraper_monitor.py --pracuj-only    # tylko Pracuj.pl
-  python scraper_monitor.py --nfj-only       # tylko NoFluffJobs
-  python scraper_monitor.py --dry-run        # walidacja bez wysyłania maila
-  python scraper_monitor.py --status         # pokaż status aktywnego runu
-  python scraper_monitor.py --status --watch # auto-odświeżanie co 5s
+Użycie (z katalogu projektu):
+  python pracuj_scraper/scraper_monitor.py                  # uruchom wszystkie scrapery
+  python pracuj_scraper/scraper_monitor.py --test-email     # wyślij testowego maila
+  python pracuj_scraper/scraper_monitor.py --pracuj-only    # tylko Pracuj.pl
+  python pracuj_scraper/scraper_monitor.py --nfj-only       # tylko NoFluffJobs
+  python pracuj_scraper/scraper_monitor.py --dry-run        # walidacja bez wysyłania maila
+  python pracuj_scraper/scraper_monitor.py --status         # pokaż status aktywnego runu
+  python pracuj_scraper/scraper_monitor.py --status --watch # auto-odświeżanie co 5s
 
 Setup (jednorazowy):
   1. Włącz 2FA na koncie Google: https://myaccount.google.com/security
