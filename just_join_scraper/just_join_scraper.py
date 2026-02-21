@@ -646,9 +646,12 @@ def upload_to_azure_sql(offers: list[dict]) -> dict:
 
 # --- Main pipeline ---
 
-def run() -> dict:
+def run(progress_callback=None) -> dict:
     """
     Glowna logika scrapera. Zwraca result dict kompatybilny z scraper_monitor.
+
+    Args:
+        progress_callback: Optional callback(current, total, phase) for progress tracking.
     """
     result = {
         "success": False,
@@ -712,6 +715,9 @@ def run() -> dict:
             processed += 1
             short = slug[:45] + ("..." if len(slug) > 45 else "")
             print(f"    [{processed:3d}/{grand_total}] {short:50s}", end="  ")
+
+            if progress_callback:
+                progress_callback(processed, grand_total, "details")
 
             offer = fetch_offer_details(session, slug)
 

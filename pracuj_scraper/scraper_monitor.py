@@ -19,6 +19,8 @@ Użycie:
   python scraper_monitor.py --pracuj-only    # tylko Pracuj.pl
   python scraper_monitor.py --nfj-only       # tylko NoFluffJobs
   python scraper_monitor.py --dry-run        # walidacja bez wysyłania maila
+  python scraper_monitor.py --status         # pokaż status aktywnego runu
+  python scraper_monitor.py --status --watch # auto-odświeżanie co 5s
 
 Setup (jednorazowy):
   1. Włącz 2FA na koncie Google: https://myaccount.google.com/security
@@ -39,6 +41,7 @@ import sys
 import json
 import smtplib
 import argparse
+import tempfile
 import traceback
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -65,6 +68,112 @@ MIN_OFFERS_PER_CATEGORY = 1   # minimum ofert per kategoria
 
 # Scrapery wymagane w każdym daily run - brak któregoś → ostrzeżenie w raporcie
 EXPECTED_SCRAPERS = ["NoFluffJobs", "JustJoin.it", "Pracuj.pl"]
+
+# Progress file — aktualizowany na bieżąco, odczytywany przez --status
+PROGRESS_FILE = SCRAPER_DIR / "scraper_progress.json"
+
+
+class ProgressTracker:
+    """Tracks scraper run progress via a JSON file for real-time monitoring."""
+
+    def __init__(self):
+        self._data = {}
+        self._scraper_start = None
+        self._item_times = []
+
+    def start_run(self, scrapers_planned: list[str]):
+        self._data = {
+            "run_started": datetime.now().isoformat(),
+            "status": "running",
+            "current_scraper": None,
+            "scraper_index": 0,
+            "scrapers_total": len(scrapers_planned),
+            "scrapers_planned": scrapers_planned,
+            "phase": None,
+            "progress": None,
+            "percent": 0,
+            "elapsed": "00:00:00",
+            "eta": None,
+            "completed_scrapers": [],
+        }
+        self._run_start = datetime.now()
+        self._save()
+
+    def start_scraper(self, name: str):
+        self._scraper_start = datetime.now()
+        self._item_times = []
+        self._data["current_scraper"] = name
+        self._data["scraper_index"] = len(self._data["completed_scrapers"]) + 1
+        self._data["phase"] = "starting"
+        self._data["progress"] = None
+        self._data["percent"] = 0
+        self._data["eta"] = None
+        self._update_elapsed()
+        self._save()
+
+    def update(self, current: int, total: int, phase: str):
+        self._item_times.append(datetime.now())
+        self._data["phase"] = phase
+        self._data["progress"] = f"{current}/{total}"
+        self._data["percent"] = round(current / total * 100) if total > 0 else 0
+        self._update_elapsed()
+        # ETA based on average time per item
+        if len(self._item_times) >= 2:
+            elapsed_items = (self._item_times[-1] - self._item_times[0]).total_seconds()
+            items_done = len(self._item_times) - 1
+            if items_done > 0:
+                avg_per_item = elapsed_items / items_done
+                remaining = (total - current) * avg_per_item
+                mins, secs = divmod(int(remaining), 60)
+                hours, mins = divmod(mins, 60)
+                self._data["eta"] = f"~{hours:02d}:{mins:02d}:{secs:02d}"
+        self._save()
+
+    def finish_scraper(self, name: str, result: dict):
+        elapsed = datetime.now() - self._scraper_start if self._scraper_start else None
+        elapsed_str = str(elapsed).split(".")[0] if elapsed else "?"
+        status = "OK" if result.get("success") else "FAIL"
+        self._data["completed_scrapers"].append({
+            "name": name,
+            "offers": result.get("total_offers", 0),
+            "duration": elapsed_str,
+            "status": status,
+        })
+        self._data["current_scraper"] = None
+        self._data["phase"] = None
+        self._data["progress"] = None
+        self._data["percent"] = 0
+        self._data["eta"] = None
+        self._update_elapsed()
+        self._save()
+
+    def finish_run(self):
+        self._data["status"] = "finished"
+        self._data["current_scraper"] = None
+        self._update_elapsed()
+        self._save()
+
+    def _update_elapsed(self):
+        if hasattr(self, "_run_start"):
+            elapsed = datetime.now() - self._run_start
+            self._data["elapsed"] = str(elapsed).split(".")[0]
+
+    def _save(self):
+        """Atomic write: write to temp file, then rename."""
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(SCRAPER_DIR), suffix=".tmp", prefix="progress_"
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2, ensure_ascii=False)
+            # On Windows, os.replace is atomic if on the same volume
+            os.replace(tmp_path, str(PROGRESS_FILE))
+        except Exception:
+            # Non-critical — don't break the scraper run
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 def load_env():
@@ -248,6 +357,27 @@ def build_success_summary(scraper_name: str, result: dict) -> str:
     return f"[OK] {scraper_name}: {total} ofert, {cats} kategorii"
 
 
+def build_start_email_html(scrapers_to_run: list[str]) -> str:
+    """Buduje HTML emaila informującego o starcie daily run."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    scraper_list = "".join(f"<li>{s}</li>" for s in scrapers_to_run)
+    return f"""
+    <html><body style="font-family:Segoe UI,Arial,sans-serif;max-width:600px;color:#333;">
+    <h2 style="color:#007bff;">&#9654; Daily Run Started — {ts}</h2>
+    <p>Scraper Monitor wystartował. Planowane scrapery:</p>
+    <ul>{scraper_list}</ul>
+    <p style="color:gray;font-size:12px;">
+      Jeśli nie otrzymasz maila FINISH w ciągu kilku godzin,
+      sprawdź logi lub Task Scheduler.
+    </p>
+    <hr>
+    <p style="color:gray;font-size:12px;">
+      Portfolio Data Factory — Scraper Monitor · {ts}
+    </p>
+    </body></html>
+    """
+
+
 def build_daily_report_html(results: dict, history: list[dict]) -> str:
     """Buduje HTML z codziennym raportem podsumowującym wszystkie scrapery.
 
@@ -370,7 +500,7 @@ def build_daily_report_html(results: dict, history: list[dict]) -> str:
 
 # --- Runner ---
 
-def run_pracuj(dry_run: bool = False) -> dict:
+def run_pracuj(dry_run: bool = False, progress_callback=None) -> dict:
     """Uruchamia Pracuj.pl scraper i zwraca wynik."""
     print("\n" + "=" * 70)
     print("  MONITOR: Uruchamiam Pracuj.pl scraper...")
@@ -378,7 +508,7 @@ def run_pracuj(dry_run: bool = False) -> dict:
 
     try:
         from pracuj_premium_scraper import run as pracuj_run
-        result = pracuj_run()
+        result = pracuj_run(progress_callback=progress_callback)
     except Exception as e:
         tb = traceback.format_exc()
         print(f"\n[MONITOR] Scraper rzucił wyjątek:\n{tb}")
@@ -395,7 +525,7 @@ def run_pracuj(dry_run: bool = False) -> dict:
     return result
 
 
-def run_nfj(dry_run: bool = False) -> dict:
+def run_nfj(dry_run: bool = False, progress_callback=None) -> dict:
     """Uruchamia NoFluffJobs scraper i zwraca wynik."""
     print("\n" + "=" * 70)
     print("  MONITOR: Uruchamiam NoFluffJobs scraper...")
@@ -404,7 +534,7 @@ def run_nfj(dry_run: bool = False) -> dict:
     try:
         sys.path.insert(0, str(PROJECT_DIR))
         from nfj_scraper.nfj_data_scraper import run as nfj_run
-        result = nfj_run()
+        result = nfj_run(progress_callback=progress_callback)
     except Exception as e:
         tb = traceback.format_exc()
         print(f"\n[MONITOR] Scraper rzucił wyjątek:\n{tb}")
@@ -420,7 +550,7 @@ def run_nfj(dry_run: bool = False) -> dict:
     return result
 
 
-def run_justjoin(dry_run: bool = False) -> dict:
+def run_justjoin(dry_run: bool = False, progress_callback=None) -> dict:
     """Uruchamia JustJoin.it scraper i zwraca wynik."""
     print("\n" + "=" * 70)
     print("  MONITOR: Uruchamiam JustJoin.it scraper...")
@@ -429,7 +559,7 @@ def run_justjoin(dry_run: bool = False) -> dict:
     try:
         sys.path.insert(0, str(PROJECT_DIR))
         from just_join_scraper.just_join_scraper import run as justjoin_run
-        result = justjoin_run()
+        result = justjoin_run(progress_callback=progress_callback)
     except Exception as e:
         tb = traceback.format_exc()
         print(f"\n[MONITOR] Scraper rzucił wyjątek:\n{tb}")
@@ -513,6 +643,64 @@ def test_email():
         print("[FAIL] Nie udało się wysłać testowego emaila.")
 
 
+def show_status():
+    """Wyświetla aktualny status runu na podstawie scraper_progress.json."""
+    if not PROGRESS_FILE.exists():
+        print("Brak aktywnego runu (scraper_progress.json nie istnieje).")
+        return False
+
+    try:
+        data = json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"Błąd odczytu progress file: {e}")
+        return False
+
+    status = data.get("status", "?")
+    elapsed = data.get("elapsed", "?")
+    started = data.get("run_started", "?")
+    if isinstance(started, str) and len(started) > 16:
+        started = started[11:16]  # HH:MM
+
+    print(f"=== Scraper Monitor — {status} ===")
+    print(f"Start: {started} | Elapsed: {elapsed}")
+    print()
+
+    for cs in data.get("completed_scrapers", []):
+        icon = "[OK]" if cs["status"] == "OK" else "[!!]"
+        print(f"  {icon} {cs['name']:15s} {cs['offers']:>5d} ofert  ({cs['duration']})")
+
+    current = data.get("current_scraper")
+    if current and status == "running":
+        phase = data.get("phase", "?")
+        progress = data.get("progress", "?")
+        percent = data.get("percent", 0)
+        eta = data.get("eta", "?")
+        scraper_idx = data.get("scraper_index", "?")
+        scrapers_total = data.get("scrapers_total", "?")
+        print(f"  [>>] {current:15s} {phase} {progress} ({percent}%)  ETA: {eta}")
+        print(f"\n  Scraper {scraper_idx}/{scrapers_total}")
+
+    if status == "finished":
+        print(f"\n  Run zakończony.")
+
+    return True
+
+
+def watch_status(interval: int = 5):
+    """Auto-odświeżanie statusu co `interval` sekund. Ctrl+C żeby wyjść."""
+    import time
+    print(f"Tryb watch — odświeżanie co {interval}s. Ctrl+C żeby wyjść.\n")
+    try:
+        while True:
+            # Clear screen (works on Windows and Unix)
+            os.system("cls" if os.name == "nt" else "clear")
+            show_status()
+            print(f"\n  (auto-refresh co {interval}s, Ctrl+C = stop)")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nZatrzymano watch.")
+
+
 def main():
     load_env()
 
@@ -522,38 +710,85 @@ def main():
     parser.add_argument("--nfj-only", action="store_true", help="Tylko NoFluffJobs")
     parser.add_argument("--justjoin-only", action="store_true", help="Tylko JustJoin.it")
     parser.add_argument("--dry-run", action="store_true", help="Bez wysyłania emaila")
+    parser.add_argument("--status", action="store_true", help="Pokaż status aktywnego runu")
+    parser.add_argument("--watch", action="store_true", help="Auto-odświeżanie statusu co 5s (z --status)")
     args = parser.parse_args()
 
     if args.test_email:
         test_email()
         return
 
+    if args.status:
+        if args.watch:
+            watch_status()
+        else:
+            show_status()
+        return
+
     # Determine which scrapers to run
     run_all = not (args.pracuj_only or args.nfj_only or args.justjoin_only)
+
+    # Lista scraperów do uruchomienia (na potrzeby emaila START)
+    scrapers_planned = []
+    if run_all or args.nfj_only:
+        scrapers_planned.append("NoFluffJobs")
+    if run_all or args.justjoin_only:
+        scrapers_planned.append("JustJoin.it")
+    if run_all or args.pracuj_only:
+        scrapers_planned.append("Pracuj.pl")
+
+    # --- Email START ---
+    start_time = datetime.now()
+    if not args.dry_run:
+        email_config = get_email_config()
+        if email_config:
+            start_subject = f"[START] Daily Run {start_time.strftime('%Y-%m-%d %H:%M')} — Portfolio Data Factory"
+            start_body = build_start_email_html(scrapers_planned)
+            send_email(start_subject, start_body, email_config)
+
+    # --- Progress Tracker ---
+    tracker = ProgressTracker()
+    tracker.start_run(scrapers_planned)
 
     # --- Uruchom scrapery ---
     # Kolejność: NFJ (szybkie API) → JustJoin (REST API) → Pracuj (Playwright, najcięższy)
     results = {}
+    fatal_error = None
 
-    # NoFluffJobs
-    if run_all or args.nfj_only:
-        result = run_nfj(dry_run=args.dry_run)
-        results["NoFluffJobs"] = result
-        monitor_scraper("NoFluffJobs", result, dry_run=args.dry_run)
+    try:
+        # NoFluffJobs
+        if run_all or args.nfj_only:
+            tracker.start_scraper("NoFluffJobs")
+            result = run_nfj(dry_run=args.dry_run, progress_callback=tracker.update)
+            results["NoFluffJobs"] = result
+            tracker.finish_scraper("NoFluffJobs", result)
+            monitor_scraper("NoFluffJobs", result, dry_run=args.dry_run)
 
-    # JustJoin.it
-    if run_all or args.justjoin_only:
-        result = run_justjoin(dry_run=args.dry_run)
-        results["JustJoin.it"] = result
-        monitor_scraper("JustJoin.it", result, dry_run=args.dry_run)
+        # JustJoin.it
+        if run_all or args.justjoin_only:
+            tracker.start_scraper("JustJoin.it")
+            result = run_justjoin(dry_run=args.dry_run, progress_callback=tracker.update)
+            results["JustJoin.it"] = result
+            tracker.finish_scraper("JustJoin.it", result)
+            monitor_scraper("JustJoin.it", result, dry_run=args.dry_run)
 
-    # Pracuj.pl (Playwright - uruchamiany jako ostatni, największe ryzyko RAM)
-    if run_all or args.pracuj_only:
-        result = run_pracuj(dry_run=args.dry_run)
-        results["Pracuj.pl"] = result
-        monitor_scraper("Pracuj.pl", result, dry_run=args.dry_run)
+        # Pracuj.pl (Playwright - uruchamiany jako ostatni, największe ryzyko RAM)
+        if run_all or args.pracuj_only:
+            tracker.start_scraper("Pracuj.pl")
+            result = run_pracuj(dry_run=args.dry_run, progress_callback=tracker.update)
+            results["Pracuj.pl"] = result
+            tracker.finish_scraper("Pracuj.pl", result)
+            monitor_scraper("Pracuj.pl", result, dry_run=args.dry_run)
+
+    except Exception as e:
+        fatal_error = f"{type(e).__name__}: {e}"
+        print(f"\n  [MONITOR] FATAL ERROR: {fatal_error}")
+        traceback.print_exc()
 
     # --- Podsumowanie ---
+    elapsed = datetime.now() - start_time
+    elapsed_str = str(elapsed).split(".")[0]  # HH:MM:SS bez mikrosekund
+
     print(f"\n{'='*70}")
     print("  MONITOR - PODSUMOWANIE")
     print(f"{'='*70}")
@@ -564,6 +799,15 @@ def main():
             all_ok = False
         print(f"  {name:20s} [{status}] {r.get('total_offers', 0)} ofert")
 
+    if fatal_error:
+        all_ok = False
+
+    # Sprawdź czy wszystkie planowane scrapery się uruchomiły
+    missing_scrapers = [s for s in scrapers_planned if s not in results]
+    if missing_scrapers:
+        all_ok = False
+        print(f"\n  [MONITOR] UWAGA: nie ukończono: {', '.join(missing_scrapers)}")
+
     # Sprawdź czy wszystkie oczekiwane scrapery uruchomiono dzisiaj
     today_date = datetime.now().strftime("%Y-%m-%d")
     history_for_check = load_history()
@@ -571,28 +815,36 @@ def main():
         h["scraper"] for h in history_for_check
         if (h.get("timestamp", "") or "").startswith(today_date)
     }
-    missing_scrapers = [s for s in EXPECTED_SCRAPERS if s not in today_ran]
-    if missing_scrapers:
+    missing_today = [s for s in EXPECTED_SCRAPERS if s not in today_ran]
+    if missing_today:
         all_ok = False
-        print(f"\n  [MONITOR] UWAGA: nie uruchomiono dzisiaj: {', '.join(missing_scrapers)}")
+        print(f"\n  [MONITOR] UWAGA: nie uruchomiono dzisiaj: {', '.join(missing_today)}")
 
+    print(f"\n  Czas trwania: {elapsed_str}")
     if all_ok:
-        print("\n  Wszystko działa poprawnie.")
+        print("  Wszystko działa poprawnie.")
     else:
-        print("\n  Wykryto problemy - sprawdź alerty powyżej.")
+        print("  Wykryto problemy - sprawdź alerty powyżej.")
 
-    # --- Wyślij dzienny raport podsumowujący ---
-    if not args.dry_run and results:
+    # --- Email FINISH (wysyłany ZAWSZE - nawet po crash) ---
+    if not args.dry_run and (results or fatal_error):
         email_config = get_email_config()
         if email_config:
             status_label = "SUCCESS" if all_ok else "FAILURE"
-            subject = f"[{status_label}] Daily Report {datetime.now().strftime('%Y-%m-%d')} — Portfolio Data Factory"
-            body = build_daily_report_html(results, history_for_check)
+            subject = f"[{status_label}] Daily Report {datetime.now().strftime('%Y-%m-%d')} ({elapsed_str}) — Portfolio Data Factory"
+            if fatal_error:
+                # Dodaj info o fatal error do raportu
+                crash_note = f'<p style="color:#dc3545;font-weight:bold;">FATAL: {fatal_error}</p>'
+                body = build_daily_report_html(results, history_for_check)
+                body = body.replace("</h2>", f"</h2>{crash_note}", 1)
+            else:
+                body = build_daily_report_html(results, history_for_check)
             send_email(subject, body, email_config)
         else:
             print("\n  [MONITOR] Brak konfiguracji email - nie wysłano raportu dziennego.")
             print("  Skonfiguruj ALERT_EMAIL_FROM/PASSWORD/TO w pliku .env")
 
+    tracker.finish_run()
     sys.exit(0 if all_ok else 1)
 
 

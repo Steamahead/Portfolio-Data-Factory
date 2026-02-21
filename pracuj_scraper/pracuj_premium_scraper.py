@@ -436,7 +436,7 @@ def _launch_headed_browser(playwright):
     return browser, ctx, page
 
 
-def phase2_deep_dive(playwright, stubs: list[dict]) -> list[dict]:
+def phase2_deep_dive(playwright, stubs: list[dict], progress_callback=None) -> list[dict]:
     """
     Otwiera każdą ofertę w headed browser (Cloudflare bypass).
     Wyciąga pełne dane z __NEXT_DATA__ detail page.
@@ -452,6 +452,9 @@ def phase2_deep_dive(playwright, stubs: list[dict]) -> list[dict]:
         cat = stub["category"]
         short_title = stub["title"][:50]
         print(f"  [{idx}/{len(stubs)}] {cat} | {short_title}...")
+
+        if progress_callback:
+            progress_callback(idx, len(stubs), "details")
 
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -704,9 +707,13 @@ def upload_to_azure_sql(df: pd.DataFrame) -> dict:
 # Main
 # ===================================================================
 
-def run() -> dict:
+def run(progress_callback=None) -> dict:
     """
     Uruchamia scraper i zwraca strukturyzowany wynik.
+
+    Args:
+        progress_callback: Optional callback(current, total, phase) for progress tracking.
+
     Zwraca dict z kluczami:
       - success: bool
       - total_offers: int
@@ -745,8 +752,11 @@ def run() -> dict:
                 print("\n[FAIL] Nie zebrano żadnych URL-i.")
                 return result
 
+            if progress_callback:
+                progress_callback(0, len(stubs), "listings_done")
+
             # FAZA 2
-            all_rows = phase2_deep_dive(p, stubs)
+            all_rows = phase2_deep_dive(p, stubs, progress_callback=progress_callback)
     except Exception as e:
         result["errors"].append(f"Krytyczny wyjątek: {e}")
         print(f"\n[FAIL] Krytyczny wyjątek: {e}")

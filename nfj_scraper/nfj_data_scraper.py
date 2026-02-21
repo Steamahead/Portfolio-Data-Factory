@@ -252,7 +252,7 @@ def save_checkpoint(details: dict) -> None:
         json.dump(details, f, ensure_ascii=False)
 
 
-def fetch_details(postings: list[dict]) -> list[dict]:
+def fetch_details(postings: list[dict], progress_callback=None) -> list[dict]:
     """Stage 2: Enrich each posting with full details from detail endpoint.
 
     Checkpoint keyed by posting ID (stable for resume).
@@ -278,6 +278,9 @@ def fetch_details(postings: list[dict]) -> list[dict]:
                 posting[key] = detail[key]
             skipped += 1
             continue
+
+        if progress_callback:
+            progress_callback(i + 1, total, "details")
 
         elapsed = time.time() - start_time
         rate = (enriched + skipped) / elapsed if elapsed > 0 else 0
@@ -719,9 +722,12 @@ def upload_to_azure_sql(df: pd.DataFrame) -> dict:
 # MAIN
 # ============================================================
 
-def run() -> dict:
+def run(progress_callback=None) -> dict:
     """
     Main pipeline. Returns a result dict compatible with scraper_monitor.
+
+    Args:
+        progress_callback: Optional callback(current, total, phase) for progress tracking.
     """
     all_categories = [c for g in PREMIUM_BASKET.values() for c in g]
     result = {
@@ -764,7 +770,7 @@ def run() -> dict:
     print(f"\n{'─' * 55}")
     print(f"  STAGE 2: DETAILS ({len(new_postings)} new offers)")
     print(f"{'─' * 55}")
-    new_postings = fetch_details(new_postings)
+    new_postings = fetch_details(new_postings, progress_callback=progress_callback)
 
     # Stage 2b: Backfill details for active rows missing body_html
     listing_by_ref = {}
