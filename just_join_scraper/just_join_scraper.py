@@ -79,6 +79,31 @@ LISTING_PAGE_SIZE = 100
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_FILE = os.path.join(_SCRIPT_DIR, "justjoin_premium_selection.json")
 CSV_FILE = os.path.join(_SCRIPT_DIR, "justjoin_premium_selection.csv")
+KNOWN_OFFERS_FILE = os.path.join(_SCRIPT_DIR, "justjoin_known_offers.json")
+
+
+# --- Known offers cache (incremental scraping) ---
+
+def load_known_offers() -> dict:
+    """Laduje znane offer_id z pliku cache. Zwraca dict {offer_id: publishedAt}."""
+    if not os.path.exists(KNOWN_OFFERS_FILE):
+        return {}
+    try:
+        with open(KNOWN_OFFERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("offers", {})
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_known_offers(known: dict):
+    """Zapisuje znane offer_id do pliku cache."""
+    data = {
+        "last_updated": datetime.now().isoformat(),
+        "offers": known,
+    }
+    with open(KNOWN_OFFERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 # --- Azure SQL Constants ---
@@ -644,18 +669,67 @@ def upload_to_azure_sql(offers: list[dict]) -> dict:
     return result
 
 
+def update_last_seen_sql(offer_ids: list[str]):
+    """
+    Aktualizuje created_at (last_seen) dla wszystkich aktywnych ofert w SQL.
+    Wywolywane po Fazie 1 — obejmuje WSZYSTKIE oferty z listingu, nie tylko nowe.
+    """
+    import pyodbc
+
+    conn_str = os.environ.get("SqlConnectionString")
+    if not conn_str or not offer_ids:
+        return
+
+    print(f"\n[SQL] Aktualizacja last_seen dla {len(offer_ids)} ofert...")
+
+    max_retries = 3
+    conn = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            conn = pyodbc.connect(conn_str, timeout=60)
+            break
+        except Exception:
+            if attempt < max_retries:
+                time.sleep(attempt * 15)
+            else:
+                print(f"  [SQL] Nie udalo sie polaczyc - pomijam UPDATE last_seen")
+                return
+
+    try:
+        with conn:
+            cursor = conn.cursor()
+            # Batch po 500 offer_id (limit parametrow SQL)
+            batch_size = 500
+            updated = 0
+            for i in range(0, len(offer_ids), batch_size):
+                batch = offer_ids[i:i + batch_size]
+                placeholders = ",".join(["?"] * len(batch))
+                sql = f"UPDATE justjoin_offers SET created_at = GETDATE() WHERE offer_id IN ({placeholders})"
+                cursor.execute(sql, *batch)
+                updated += cursor.rowcount
+            conn.commit()
+            print(f"  [SQL] last_seen zaktualizowano dla {updated} ofert")
+    except Exception as e:
+        print(f"  [SQL] Blad UPDATE last_seen: {e}")
+
+
 # --- Main pipeline ---
 
-def run(progress_callback=None) -> dict:
+def run(progress_callback=None, full_mode: bool = False) -> dict:
     """
     Glowna logika scrapera. Zwraca result dict kompatybilny z scraper_monitor.
 
     Args:
         progress_callback: Optional callback(current, total, phase) for progress tracking.
+        full_mode: Jesli True, pomija cache i pobiera detale wszystkich ofert.
     """
+    incremental = not full_mode
+
     result = {
         "success": False,
         "total_offers": 0,
+        "new_offers": 0,
+        "skipped_known": 0,
         "categories_ok": [],
         "categories_empty": [],
         "errors": [],
@@ -668,6 +742,7 @@ def run(progress_callback=None) -> dict:
     print(f"  Data:       {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"  Kategorie:  {', '.join(c.upper() for c in CATEGORIES)}")
     print(f"  Metoda:     100% REST API (bez Playwright)")
+    print(f"  Tryb:       {'PELNY (--full)' if full_mode else 'INKREMENTALNY'}")
     print("=" * 65)
 
     # Inicjalizacja sesji (ciasteczka)
@@ -693,14 +768,55 @@ def run(progress_callback=None) -> dict:
         polite_delay(1.0, 2.0)
 
     grand_total = sum(len(v) for v in category_items.values())
-    print(f"\n  Lacznie: {grand_total} unikalnych ofert do Deep Dive")
+    print(f"\n  Lacznie: {grand_total} unikalnych ofert w listingu")
 
     if grand_total == 0:
         result["errors"].append("API zwrocilo 0 ofert we wszystkich kategoriach!")
         return result
 
+    # Zapisujemy listing count dla monitora (PRZED filtrowaniem)
+    result["total_offers"] = grand_total
+
+    # ---- UPDATE last_seen w SQL dla WSZYSTKICH aktywnych ofert ----
+    all_listing_ids = [it["offer_id"] for items in category_items.values() for it in items]
+    update_last_seen_sql(all_listing_ids)
+
+    # ---- Filtracja known_offers (tryb inkrementalny) ----
+    known_offers = {}
+    if incremental:
+        known_offers = load_known_offers()
+        if known_offers:
+            total_before = sum(len(v) for v in category_items.values())
+            for cat in category_items:
+                category_items[cat] = [
+                    it for it in category_items[cat]
+                    if it["offer_id"] not in known_offers
+                ]
+            new_total = sum(len(v) for v in category_items.values())
+            skipped = total_before - new_total
+            result["skipped_known"] = skipped
+            print(f"\n[INCREMENTAL] Znanych ofert: {skipped}, nowych do pobrania: {new_total}")
+            for cat in CATEGORIES:
+                cat_count = len(category_items.get(cat, []))
+                if cat_count > 0:
+                    print(f"  {cat.upper():12s}  {cat_count} nowych")
+        else:
+            print(f"\n[INCREMENTAL] Brak cache — pierwsze uruchomienie, pobieram wszystko")
+
+    grand_total_details = sum(len(v) for v in category_items.values())
+
+    if grand_total_details == 0 and incremental and known_offers:
+        print(f"\n[OK] Brak nowych ofert — wszystkie {grand_total} juz znane.")
+        result["success"] = True
+        result["new_offers"] = 0
+        for cat in CATEGORIES:
+            result["categories_ok"].append(cat)
+        save_known_offers(known_offers)
+        return result
+
     # ---- FAZA 2: Deep Dive (tylko PL) ----
-    print("\n[FAZA 2] Pobieranie szczegolow ofert (REST API, filtr: PL)...\n")
+    mode_label = "tylko NOWE" if incremental and known_offers else "wszystkie"
+    print(f"\n[FAZA 2] Pobieranie szczegolow ofert ({mode_label}, filtr: PL)...\n")
     all_offers: list[dict] = []
     stats: dict[str, int] = {}
     processed = 0
@@ -714,10 +830,10 @@ def run(progress_callback=None) -> dict:
             slug = item["slug"]
             processed += 1
             short = slug[:45] + ("..." if len(slug) > 45 else "")
-            print(f"    [{processed:3d}/{grand_total}] {short:50s}", end="  ")
+            print(f"    [{processed:3d}/{grand_total_details}] {short:50s}", end="  ")
 
             if progress_callback:
-                progress_callback(processed, grand_total, "details")
+                progress_callback(processed, grand_total_details, "details")
 
             offer = fetch_offer_details(session, slug)
 
@@ -767,11 +883,20 @@ def run(progress_callback=None) -> dict:
     if sql_result["errors"]:
         result["errors"].extend(sql_result["errors"])
 
+    # ---- Zapis known_offers cache ----
+    for offer in all_offers:
+        known_offers[offer["offer_id"]] = offer.get("published_at", "")
+    save_known_offers(known_offers)
+    print(f"  Cache zapisano:    {KNOWN_OFFERS_FILE} ({len(known_offers)} ofert)")
+
     # ---- Podsumowanie ----
     print("=" * 65)
     print("  PODSUMOWANIE")
     print("=" * 65)
-    print(f"  Lacznie ofert:     {len(all_offers)}")
+    print(f"  Ofert w listingu:  {grand_total}")
+    print(f"  Nowych (detale):   {len(all_offers)}")
+    if incremental and result["skipped_known"] > 0:
+        print(f"  Pominiete (znane): {result['skipped_known']}")
     for cat, count in stats.items():
         print(f"    {cat.upper():15s}  {count}")
     print(f"  Bledy/pominiete:   {errors}")
@@ -788,7 +913,8 @@ def run(progress_callback=None) -> dict:
 
     # ---- Build monitor result ----
     result["success"] = True
-    result["total_offers"] = len(all_offers)
+    # total_offers = listing count (ustawiony wczesniej), nie detale
+    result["new_offers"] = len(all_offers)
     for cat in CATEGORIES:
         if stats.get(cat, 0) > 0:
             result["categories_ok"].append(cat)
@@ -806,8 +932,10 @@ def main():
     # Lokalny _load_env() — scraper dziala niezaleznie od pracuj_scraper
     _load_env()
 
+    full_mode = "--full" in sys.argv
+
     try:
-        result = run()
+        result = run(full_mode=full_mode)
     except Exception as e:
         tb = traceback.format_exc()
         print(f"\n[MONITOR] Scraper rzucil wyjatek:\n{tb}")
