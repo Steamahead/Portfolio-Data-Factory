@@ -1,0 +1,61 @@
+# CEE FX Volatility Pipeline — Configuration
+# ============================================
+
+# FX currency pairs (EUR as base — isolates European dynamics)
+fx_pairs:
+  - ticker: "EURPLN=X"
+    name: "EUR/PLN"
+  - ticker: "EURCZK=X"
+    name: "EUR/CZK"
+  - ticker: "EURHUF=X"
+    name: "EUR/HUF"
+
+# Validation ranges (reject records outside these bounds)
+fx_validation:
+  "EUR/PLN":
+    min: 3.0
+    max: 6.0
+  "EUR/CZK":
+    min: 20.0
+    max: 30.0
+  "EUR/HUF":
+    min: 300.0
+    max: 500.0
+
+# yfinance settings
+yfinance:
+  interval: "1h"
+  max_backfill_days: 730   # yfinance limit for 1h data
+
+# RSS news sources
+rss_feeds:
+  - name: "bankier"
+    url: "https://www.bankier.pl/rss/wiadomosci.xml"
+  - name: "money"
+    url: "https://www.money.pl/rss/rss.xml"
+  # PAP Biznes nie udostepnia publicznego RSS — wylaczony
+  # - name: "pap"
+  #   url: "https://biznes.pap.pl/pl/rss/6"
+
+# Spam filter — reject headlines containing these phrases (case-insensitive)
+spam_phrases:
+  - "artykuł sponsorowany"
+  - "materiał partnera"
+  - "reklama"
+  - "materiał promocyjny"
+
+# Minimum headline length (characters)
+min_headline_length: 15
+
+# Gemini AI classification
+gemini:
+  model: "gemini-2.5-flash"
+  # API key loaded from .env (GEMINI_API_KEY)
+
+# News categories (for Gemini structured output)
+categories:
+  - "POLITYKA_KRAJOWA"
+  - "MAKROEKONOMIA"
+  - "RPP_STOPY"
+  - "GEOPOLITYKA"
+  - "INNE"
