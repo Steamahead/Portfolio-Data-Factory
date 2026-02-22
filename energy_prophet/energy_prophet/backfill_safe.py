@@ -28,9 +28,18 @@ def run_backfill():
     print("🚀 STARTING FULL BACKFILL (ENERGY + WEATHER)")
 
     # --- USTAWIENIE CONNECTION STRING ---
-    # WPISZ SWOJE HASŁO PONIŻEJ!
-    conn_str = "Driver={ODBC Driver 18 for SQL Server};Server=sadza-portfolio-server.database.windows.net;Database=PortfolioMasterDB;Uid=Portfolio_db_admin;Pwd=Jestem_szczesliwy1!;Encrypt=yes;TrustServerCertificate=no;"
-
+    # Ładuje z local.settings.json lub zmiennej środowiskowej
+    conn_str = os.environ.get('SqlConnectionString')
+    if not conn_str:
+        import json
+        settings_path = os.path.join(parent_dir, 'local.settings.json')
+        if os.path.exists(settings_path):
+            with open(settings_path, encoding='utf-8') as f:
+                settings = json.load(f)
+            conn_str = settings.get('Values', {}).get('SqlConnectionString')
+    if not conn_str:
+        print("Brak SqlConnectionString — ustaw w local.settings.json lub zmiennej środowiskowej")
+        sys.exit(1)
     os.environ['SqlConnectionString'] = conn_str
     # ------------------------------------
 
