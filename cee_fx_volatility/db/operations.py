@@ -1,11 +1,11 @@
 """
 Azure SQL operations — upload FX rates and news headlines.
 ==========================================================
-Follows Portfolio Data Factory patterns:
-  - _load_env() for .env config
-  - 3-retry linear backoff for connection
-  - Row-by-row MERGE (upsert)
-  - Returns {"uploaded": int, "errors": list[str]}
+Two-layer retry (modeled after energy_prophet/pse_connector.py):
+  Layer 1: _connect_with_retry() — 5 attempts, 10s/20s/30s/40s/50s backoff
+  Layer 2: upload functions      — 3 batch attempts, 15s/30s/45s backoff
+  Each batch attempt gets a fresh connection with its own 5 retries.
+  Total worst-case: ~4 minutes of retries before giving up.
 """
 
 import json
@@ -59,39 +59,50 @@ def _load_env() -> None:
 _load_env()
 
 
-# ── Connection helper ──────────────────────────────────────────────
+# ── Layer 1: Connection with retry (PSE pattern) ──────────────────
 
-def _get_connection(max_retries: int = 3) -> pyodbc.Connection | None:
-    """Connect to Azure SQL with linear backoff retry."""
+def _connect_with_retry(max_retries: int = 5) -> pyodbc.Connection:
+    """
+    Connect to Azure SQL with retry logic for serverless cold starts.
+    5 attempts with linear backoff: 10s, 20s, 30s, 40s, 50s.
+    Raises on final failure.
+    """
     conn_str = os.environ.get("SqlConnectionString")
     if not conn_str:
-        print("  [SQL] Brak SqlConnectionString w .env")
-        return None
+        raise RuntimeError("Brak SqlConnectionString w zmiennych środowiskowych")
 
-    for attempt in range(1, max_retries + 1):
+    # Enforce connection timeout
+    if "Connection Timeout" not in conn_str:
+        conn_str += ";Connection Timeout=30"
+
+    for attempt in range(max_retries):
         try:
-            conn = pyodbc.connect(conn_str, timeout=60)
-            print(f"  [SQL] Połączono (próba {attempt}/{max_retries})")
+            conn = pyodbc.connect(conn_str)
+            if attempt > 0:
+                print(f"  [SQL] Połączono (po {attempt + 1} próbach — baza się obudziła)")
+            else:
+                print(f"  [SQL] Połączono")
             return conn
-        except pyodbc.Error as e:
-            if attempt < max_retries:
-                wait = attempt * 15
-                print(f"  [SQL] Baza niedostępna (próba {attempt}/{max_retries}), czekam {wait}s...")
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait = (attempt + 1) * 10
+                print(f"  [SQL] Baza niedostępna (próba {attempt + 1}/{max_retries}), "
+                      f"czekam {wait}s... [{e}]")
                 time.sleep(wait)
             else:
-                print(f"  [SQL] Błąd połączenia po {max_retries} próbach: {e}")
-    return None
+                raise
 
 
-# ── FX upload ──────────────────────────────────────────────────────
+# ── Layer 2: Batch upload with retry ──────────────────────────────
 
 def upload_fx_rates(records: list[dict]) -> dict:
     """
     Upload FX rate records to Azure SQL (table cee_fx_rates).
     Uses MERGE (upsert) on (timestamp, currency_pair) — safe for repeated runs.
 
-    Args:
-        records: list of dicts with keys matching FX_SQL_COLUMNS
+    Two-layer retry:
+      - Each batch attempt gets a fresh connection (up to 5 connection retries)
+      - Up to 3 batch attempts with 15s/30s/45s backoff
 
     Returns:
         {"uploaded": int, "errors": list[str]}
@@ -103,49 +114,54 @@ def upload_fx_rates(records: list[dict]) -> dict:
         return result
 
     print(f"\n[SQL] Upload {len(records)} rekordów FX...")
-    conn = _get_connection()
-    if not conn:
-        result["errors"].append("Nie udało się połączyć z Azure SQL")
-        return result
 
-    try:
-        with conn:
-            cursor = conn.cursor()
-            cursor.execute(CREATE_FX_TABLE_SQL)
-            conn.commit()
-            print("  [SQL] Tabela cee_fx_rates — OK")
+    max_batch_retries = 3
+    for batch_attempt in range(max_batch_retries):
+        try:
+            with _connect_with_retry() as conn:
+                cursor = conn.cursor()
+                cursor.execute(CREATE_FX_TABLE_SQL)
+                conn.commit()
+                print("  [SQL] Tabela cee_fx_rates — OK")
 
-            uploaded = 0
-            for rec in records:
-                vals = [rec.get(col) for col in FX_SQL_COLUMNS]
-                try:
-                    cursor.execute(MERGE_FX_SQL, *vals)
-                    uploaded += 1
-                except Exception as e:
-                    err = f"FX {rec.get('timestamp')} {rec.get('currency_pair')}: {e}"
-                    print(f"  [SQL] BŁĄD: {err}")
-                    result["errors"].append(err)
+                uploaded = 0
+                row_errors = []
+                for rec in records:
+                    vals = [rec.get(col) for col in FX_SQL_COLUMNS]
+                    try:
+                        cursor.execute(MERGE_FX_SQL, *vals)
+                        uploaded += 1
+                    except Exception as e:
+                        err = f"FX {rec.get('timestamp')} {rec.get('currency_pair')}: {e}"
+                        print(f"  [SQL] BŁĄD: {err}")
+                        row_errors.append(err)
 
-            conn.commit()
-            result["uploaded"] = uploaded
-            print(f"  [SQL] FX upload: {uploaded}/{len(records)} rekordów")
-    except pyodbc.Error as e:
-        msg = f"Błąd SQL (FX): {e}"
-        print(f"  [SQL] {msg}")
-        result["errors"].append(msg)
+                conn.commit()
+                result["uploaded"] = uploaded
+                result["errors"] = row_errors
+                print(f"  [SQL] FX upload: {uploaded}/{len(records)} rekordów")
+                return result  # success — exit retry loop
+
+        except Exception as e:
+            if batch_attempt < max_batch_retries - 1:
+                wait = (batch_attempt + 1) * 15
+                print(f"  [SQL] Batch FX nieudany (próba {batch_attempt + 1}/{max_batch_retries}), "
+                      f"czekam {wait}s... [{e}]")
+                time.sleep(wait)
+            else:
+                msg = f"FX batch failed po {max_batch_retries} próbach: {e}"
+                print(f"  [SQL] {msg}")
+                result["errors"].append(msg)
 
     return result
 
-
-# ── News upload ────────────────────────────────────────────────────
 
 def upload_news(records: list[dict]) -> dict:
     """
     Upload news headline records to Azure SQL (table cee_news_headlines).
     Uses MERGE (upsert) on url — safe for repeated runs.
 
-    Args:
-        records: list of dicts with keys matching NEWS_SQL_COLUMNS
+    Two-layer retry (same as upload_fx_rates).
 
     Returns:
         {"uploaded": int, "errors": list[str]}
@@ -157,35 +173,43 @@ def upload_news(records: list[dict]) -> dict:
         return result
 
     print(f"\n[SQL] Upload {len(records)} newsów...")
-    conn = _get_connection()
-    if not conn:
-        result["errors"].append("Nie udało się połączyć z Azure SQL")
-        return result
 
-    try:
-        with conn:
-            cursor = conn.cursor()
-            cursor.execute(CREATE_NEWS_TABLE_SQL)
-            conn.commit()
-            print("  [SQL] Tabela cee_news_headlines — OK")
+    max_batch_retries = 3
+    for batch_attempt in range(max_batch_retries):
+        try:
+            with _connect_with_retry() as conn:
+                cursor = conn.cursor()
+                cursor.execute(CREATE_NEWS_TABLE_SQL)
+                conn.commit()
+                print("  [SQL] Tabela cee_news_headlines — OK")
 
-            uploaded = 0
-            for rec in records:
-                vals = [rec.get(col) for col in NEWS_SQL_COLUMNS]
-                try:
-                    cursor.execute(MERGE_NEWS_SQL, *vals)
-                    uploaded += 1
-                except Exception as e:
-                    err = f"News {rec.get('url', '?')}: {e}"
-                    print(f"  [SQL] BŁĄD: {err}")
-                    result["errors"].append(err)
+                uploaded = 0
+                row_errors = []
+                for rec in records:
+                    vals = [rec.get(col) for col in NEWS_SQL_COLUMNS]
+                    try:
+                        cursor.execute(MERGE_NEWS_SQL, *vals)
+                        uploaded += 1
+                    except Exception as e:
+                        err = f"News {rec.get('url', '?')}: {e}"
+                        print(f"  [SQL] BŁĄD: {err}")
+                        row_errors.append(err)
 
-            conn.commit()
-            result["uploaded"] = uploaded
-            print(f"  [SQL] News upload: {uploaded}/{len(records)} rekordów")
-    except pyodbc.Error as e:
-        msg = f"Błąd SQL (news): {e}"
-        print(f"  [SQL] {msg}")
-        result["errors"].append(msg)
+                conn.commit()
+                result["uploaded"] = uploaded
+                result["errors"] = row_errors
+                print(f"  [SQL] News upload: {uploaded}/{len(records)} rekordów")
+                return result  # success — exit retry loop
+
+        except Exception as e:
+            if batch_attempt < max_batch_retries - 1:
+                wait = (batch_attempt + 1) * 15
+                print(f"  [SQL] Batch news nieudany (próba {batch_attempt + 1}/{max_batch_retries}), "
+                      f"czekam {wait}s... [{e}]")
+                time.sleep(wait)
+            else:
+                msg = f"News batch failed po {max_batch_retries} próbach: {e}"
+                print(f"  [SQL] {msg}")
+                result["errors"].append(msg)
 
     return result
