@@ -27,5 +27,7 @@ bin/
 obj/
 appsettings.json
 !EnergyDailyRun/function.json
+!ShillerDailyRun/function.json
+!CeeFxDailyRun/function.json
 energy_prophet/backfill_safe.py
 energy_prophet/backfill_feb2026.py
