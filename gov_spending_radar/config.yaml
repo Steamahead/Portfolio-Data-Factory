@@ -1,0 +1,108 @@
+# Gov Spending Radar — configuration
+# ===================================
+
+# API settings
+api:
+  base_url: "https://ezamowienia.gov.pl/mo-board/api/v1/notice"
+  max_page_size: 500
+  window_hours: 6          # time window for pagination splitting
+  request_timeout: 30
+  max_http_retries: 3
+  delay_min: 0.5           # anti-bot delay (seconds)
+  delay_max: 1.5
+
+# Notice types to collect
+notice_types:
+  - ContractNotice
+  - TenderResultNotice
+  # ContractPerformingNotice — skipped (often null contractors, low value)
+
+# ── CPV-based sector classification ─────────────────────────────
+# Maps CPV code prefixes to sectors. First match wins.
+# Used by classify_by_cpv() in main.py.
+
+cpv_sectors:
+  IT:
+    prefixes:
+      - "72"    # IT services (software, data processing, internet)
+      - "48"    # Software packages and information systems
+      - "302"   # Computer equipment (monitors, storage, etc.)
+      - "323"   # TV/radio/telecom equipment
+      - "324"   # Network equipment
+    keywords_pl:
+      - "informatyk"
+      - "oprogramowani"
+      - "system informatyczn"
+      - "serwer"
+      - "baza danych"
+      - "chmur"           # chmura/chmurowy
+      - "cloud"
+      - "SaaS"
+      - "ERP"
+      - "CRM"
+
+  CYBERSECURITY:
+    prefixes:
+      - "7280"  # Computer audit and testing
+    keywords_pl:
+      - "cyberbezpiecze"
+      - "bezpieczeństwo informac"
+      - "bezpieczeństwo IT"
+      - "SOC"
+      - "SIEM"
+      - "pentest"
+      - "audyt bezpiecze"
+      - "ochrona danych"
+
+  AI:
+    prefixes: []            # no dedicated CPV for AI yet
+    keywords_pl:
+      - "sztuczn"           # sztuczna inteligencja
+      - "artificial intelligen"
+      - "machine learning"
+      - "uczeni"            # uczenie maszynowe
+      - "deep learning"
+      - "neural"
+      - "model językow"     # model językowy
+      - "LLM"
+      - "GPT"
+      - "chatbot"
+
+  TELECOM:
+    prefixes:
+      - "642"   # Telecommunication services
+      - "325"   # Radio/TV installation
+    keywords_pl:
+      - "telekomunikac"
+      - "łącznoś"
+      - "5G"
+      - "światłowod"
+
+  CONSTRUCTION:
+    prefixes:
+      - "45"    # Construction works
+      - "71"    # Architectural/engineering services
+    keywords_pl: []
+
+  MEDICAL:
+    prefixes:
+      - "33"    # Medical equipment
+      - "85"    # Health services
+    keywords_pl: []
+
+  ENERGY:
+    prefixes:
+      - "09"    # Petroleum, fuel, electricity
+      - "65"    # Utility services
+    keywords_pl: []
+
+# ── Sector priority (for overlapping CPV) ────────────────────────
+# If a notice matches multiple sectors, highest priority wins.
+sector_priority:
+  - AI
+  - CYBERSECURITY
+  - IT
+  - TELECOM
+  - CONSTRUCTION
+  - MEDICAL
+  - ENERGY
