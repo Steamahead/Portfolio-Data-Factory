@@ -29,13 +29,20 @@ yfinance:
 
 # RSS news sources
 rss_feeds:
-  - name: "bankier"
-    url: "https://www.bankier.pl/rss/wiadomosci.xml"
+  - name: "bankier_waluty"
+    url: "https://www.bankier.pl/rss/waluty.xml"
+  - name: "bankier_gielda"
+    url: "https://www.bankier.pl/rss/gielda.xml"
   - name: "money"
     url: "https://www.money.pl/rss/rss.xml"
+  - name: "investing_economy"
+    url: "https://pl.investing.com/rss/news_95.rss"
   # PAP Biznes nie udostepnia publicznego RSS — wylaczony
   # - name: "pap"
   #   url: "https://biznes.pap.pl/pl/rss/6"
+  # ISBnews — feed nie dziala (HTTP 404 na /feed/, /rss/). Sprawdzono 2026-02-24.
+  # - name: "isbnews"
+  #   url: "https://www.isbnews.pl/feed/"
 
 # Spam filter — reject headlines containing these phrases (case-insensitive)
 spam_phrases:
@@ -44,8 +51,48 @@ spam_phrases:
   - "reklama"
   - "materiał promocyjny"
 
+# Maximum age of RSS articles in days (older are rejected as stale)
+max_article_age_days: 7
+
 # Minimum headline length (characters)
 min_headline_length: 15
+
+# Irrelevant region filter — reject headlines about countries outside CEE/EU/US scope
+# Applied only to investing_economy feed (global PMI dump)
+irrelevant_regions:
+  - "Mozambik"
+  - "Uganda"
+  - "Kenia"
+  - "Zambi"          # Zambia, Zambijski
+  - "Nigeria"
+  - "Egipt"
+  - "RPA"
+  - "Ghana"
+  - "Tanzania"
+  - "Etiopi"
+  - "Bangladesz"
+  - "Pakistan"
+  - "Sri Lank"
+  - "Filipin"
+  - "Wietnam"
+  - "Tajlandi"       # Tajlandia, Tajlandzki
+  - "Indonezj"
+  - "Malezj"
+  - "Kolumbi"
+  - "Peru"
+  - "Meksyk"
+  - "Brazyli"
+  - "Argentyn"
+  - "Chile"
+  - "Wenezuel"
+  - "Ekwador"
+  - "Birm"           # Birma/Myanmar
+  - "Myanmar"
+  - "Kambodż"
+  - "Liban"
+  - "Irak"
+  - "Arabia Saudyjsk"
+  - "Kazachstan"
 
 # Gemini AI classification
 gemini:

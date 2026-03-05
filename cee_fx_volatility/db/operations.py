@@ -11,11 +11,13 @@ Two-layer retry (modeled after energy_prophet/pse_connector.py):
 import json
 import os
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pyodbc
 
 from .schema import (
+    ALTER_NEWS_ADD_DESCRIPTION_SQL,
     CREATE_FX_TABLE_SQL,
     CREATE_NEWS_TABLE_SQL,
     MERGE_FX_SQL,
@@ -180,6 +182,7 @@ def upload_news(records: list[dict]) -> dict:
             with _connect_with_retry() as conn:
                 cursor = conn.cursor()
                 cursor.execute(CREATE_NEWS_TABLE_SQL)
+                cursor.execute(ALTER_NEWS_ADD_DESCRIPTION_SQL)
                 conn.commit()
                 print("  [SQL] Tabela cee_news_headlines — OK")
 
@@ -213,3 +216,93 @@ def upload_news(records: list[dict]) -> dict:
                 result["errors"].append(msg)
 
     return result
+
+
+# ── Reclassify: fetch unclassified news ──────────────────────────
+
+def fetch_unclassified_news() -> list[dict]:
+    """
+    Fetch news records where category IS NULL (not yet classified by Gemini).
+
+    Returns:
+        List of dicts with 'url' and 'title' keys.
+    """
+    try:
+        with _connect_with_retry() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT url, title, description FROM cee_news_headlines WHERE category IS NULL"
+            )
+            rows = cursor.fetchall()
+            return [{"url": row[0], "title": row[1], "description": row[2]} for row in rows]
+    except Exception as e:
+        print(f"  [SQL] Błąd pobierania niesklasyfikowanych newsów: {e}")
+        return []
+
+
+def update_news_classification(url: str, category: str, sentiment: float,
+                                is_surprising: int, raw_ai_response: str) -> bool:
+    """Update AI classification fields for a single news record by URL."""
+    try:
+        with _connect_with_retry() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """UPDATE cee_news_headlines
+                   SET category = ?, sentiment = ?, is_surprising = ?, raw_ai_response = ?
+                   WHERE url = ?""",
+                category, sentiment, is_surprising, raw_ai_response, url
+            )
+            conn.commit()
+            return True
+    except Exception as e:
+        print(f"  [SQL] Błąd aktualizacji klasyfikacji dla {url[:60]}: {e}")
+        return False
+
+
+# ── Cleanup: remove stale/spam records ────────────────────────────
+
+def cleanup_stale_news(max_age_days: int = 7) -> int:
+    """
+    Delete news records older than max_age_days.
+
+    Returns:
+        Number of deleted rows.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat() + "Z"
+    try:
+        with _connect_with_retry() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """DELETE FROM cee_news_headlines
+                   WHERE published_at IS NOT NULL AND published_at < ?""",
+                cutoff
+            )
+            deleted = cursor.rowcount
+            conn.commit()
+            return deleted
+    except Exception as e:
+        print(f"  [SQL] Błąd usuwania starych newsów: {e}")
+        return 0
+
+
+def cleanup_auto_fx_headlines() -> int:
+    """
+    Delete auto-generated FX headlines (Money.pl "Ile kosztuje" / "Kurs ... PLN/").
+
+    Returns:
+        Number of deleted rows.
+    """
+    try:
+        with _connect_with_retry() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """DELETE FROM cee_news_headlines
+                   WHERE title LIKE 'Ile kosztuje%'
+                      OR title LIKE 'Kurs %% do z_otego PLN/%%'"""
+            )
+            deleted = cursor.rowcount
+            conn.commit()
+            return deleted
+    except Exception as e:
+        print(f"  [SQL] Błąd usuwania auto-generated FX headlines: {e}")
+        return 0

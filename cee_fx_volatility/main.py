@@ -203,6 +203,76 @@ def _run_fx_pipeline(backfill_days: int | None = None) -> dict:
     }
 
 
+def _run_reclassify() -> None:
+    """Fetch unclassified news from DB, run through Gemini, update in place."""
+    from .db.operations import fetch_unclassified_news, update_news_classification, _load_env
+    from .ai.classifier import classify_headline
+
+    _load_env()
+
+    print(f"\n{'─' * 55}")
+    print("  RECLASSIFY — Gemini reklasyfikacja niesklasyfikowanych newsów")
+    print(f"{'─' * 55}")
+
+    records = fetch_unclassified_news()
+    if not records:
+        print("  Brak niesklasyfikowanych newsów w bazie")
+        return
+
+    print(f"  Znaleziono {len(records)} newsów do reklasyfikacji\n")
+
+    ok = 0
+    fail = 0
+    for i, rec in enumerate(records):
+        title = rec["title"]
+        description = rec.get("description")
+        url = rec["url"]
+        print(f"  [{i + 1}/{len(records)}] {title[:60]}...", end=" ", flush=True)
+
+        result = classify_headline(title, description=description)
+        if result:
+            success = update_news_classification(
+                url=url,
+                category=result["category"],
+                sentiment=result["sentiment"],
+                is_surprising=result["is_surprising"],
+                raw_ai_response=result["raw_ai_response"],
+            )
+            if success:
+                ok += 1
+                print(f"→ {result['category']} ({result['sentiment']:+.2f})")
+            else:
+                fail += 1
+                print("→ UPDATE FAILED")
+        else:
+            fail += 1
+            print("→ BRAK KLASYFIKACJI")
+
+        import time as _time
+        _time.sleep(0.5)
+
+    print(f"\n  Reklasyfikacja: {ok} OK, {fail} nieudanych (z {len(records)} łącznie)")
+
+
+def _run_cleanup() -> None:
+    """One-time cleanup: delete stale articles and auto-generated FX headlines from DB."""
+    from .db.operations import cleanup_stale_news, cleanup_auto_fx_headlines, _load_env
+
+    _load_env()
+
+    print(f"\n{'─' * 55}")
+    print("  CLEANUP — Usuwanie starych i auto-generated rekordów")
+    print(f"{'─' * 55}")
+
+    stale_deleted = cleanup_stale_news(max_age_days=7)
+    print(f"  Stale articles (>7 dni): {stale_deleted} usuniętych")
+
+    fx_deleted = cleanup_auto_fx_headlines()
+    print(f"  Auto-generated FX headlines: {fx_deleted} usuniętych")
+
+    print(f"  Łącznie usunięto: {stale_deleted + fx_deleted} rekordów")
+
+
 def _run_news_pipeline() -> dict:
     """Run news collection + AI classification pipeline."""
     from .collectors.news_collector import fetch_news
@@ -313,6 +383,8 @@ Przyklady:
   python -X utf8 cee_fx_volatility/main.py --backfill 30    # FX z ostatnich 30 dni
   python -X utf8 cee_fx_volatility/main.py --fx-only        # tylko kursy
   python -X utf8 cee_fx_volatility/main.py --news-only      # tylko newsy
+  python -X utf8 cee_fx_volatility/main.py --reclassify     # reklasyfikuj NULL newsy
+  python -X utf8 cee_fx_volatility/main.py --cleanup        # usun stare/spam z bazy
         """,
     )
     parser.add_argument(
@@ -332,6 +404,16 @@ Przyklady:
         action="store_true",
         help="Uruchom tylko strumien newsow (bez FX)",
     )
+    parser.add_argument(
+        "--reclassify",
+        action="store_true",
+        help="Reklasyfikuj newsy z NULL category przez Gemini (UPDATE, nie INSERT)",
+    )
+    parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Jednorazowe usuniecie starych artykulow i auto-generated FX headlines z bazy",
+    )
 
     args = parser.parse_args()
 
@@ -344,6 +426,15 @@ Przyklady:
     print("  Zloty pod Presja — CEE Edition")
     print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'═' * 55}")
+
+    # Special modes (run and exit)
+    if args.cleanup:
+        _run_cleanup()
+        sys.exit(0)
+
+    if args.reclassify:
+        _run_reclassify()
+        sys.exit(0)
 
     result = run(
         backfill_days=args.backfill,

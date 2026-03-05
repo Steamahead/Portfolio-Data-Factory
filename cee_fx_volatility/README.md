@@ -11,7 +11,7 @@ Dwa niezalezne strumienie danych:
 ```
 main.py (orchestrator + CLI)
 ├── Strumien FX:    yfinance → walidacja → Azure SQL (cee_fx_rates)
-└── Strumien News:  RSS → filtr spamu → Gemini AI → Azure SQL (cee_news_headlines)
+└── Strumien News:  RSS (tytul+opis) → filtr spamu → Gemini AI → Azure SQL (cee_news_headlines)
 ```
 
 Strumienie dzialaja niezaleznie — awaria jednego nie blokuje drugiego. W weekendy newsy moga splywac bez danych FX.
@@ -33,6 +33,12 @@ Strumienie dzialaja niezaleznie — awaria jednego nie blokuje drugiego. W weeke
 
 # Tylko newsy
 .venv\Scripts\python.exe -X utf8 -m cee_fx_volatility.main --news-only
+
+# Reklasyfikacja newsow z NULL category (po podpieciu klucza Gemini)
+.venv\Scripts\python.exe -X utf8 -m cee_fx_volatility.main --reclassify
+
+# Jednorazowe czyszczenie: usun stare artykuly i auto-generated FX headlines z bazy
+.venv\Scripts\python.exe -X utf8 -m cee_fx_volatility.main --cleanup
 ```
 
 **Wymagane zmienne srodowiskowe** (w `.env` w katalogu projektu):
@@ -51,7 +57,7 @@ Strumienie dzialaja niezaleznie — awaria jednego nie blokuje drugiego. W weeke
 | `high` | REAL | yfinance | Najwyzsza cena w okresie |
 | `low` | REAL | yfinance | Najnizsza cena w okresie |
 | `close` | REAL | yfinance | Cena zamkniecia |
-| `volume` | REAL, nullable | yfinance | Tick volume (niska wiarygodnosc, pole informacyjne) |
+| `volume` | REAL, nullable | yfinance | Tick volume — zawsze 0 dla par EUR/CEE (FX OTC, brak danych) |
 | `volatility_1h` | REAL | obliczane | (high - low) / open — rozstep swiecy |
 | `created_at` | DATETIME | system | Timestamp insertu/updatu w bazie |
 
@@ -67,8 +73,9 @@ Strumienie dzialaja niezaleznie — awaria jednego nie blokuje drugiego. W weeke
 | `id` | INT, PK, IDENTITY | system | Auto-increment ID |
 | `published_at` | NVARCHAR(30), nullable | RSS feed | Data publikacji skonwertowana do UTC |
 | `fetched_at` | NVARCHAR(30) | system | Moment pobrania w UTC |
-| `source` | NVARCHAR(20) | config | bankier / money / pap |
+| `source` | NVARCHAR(20) | config | bankier_waluty / bankier_gielda / money / investing_economy |
 | `title` | NVARCHAR(1000) | RSS feed | Naglowek artykulu |
+| `description` | NVARCHAR(MAX), nullable | RSS feed | Opis/summary z RSS (HTML stripped). Uzywany przez Gemini do klasyfikacji razem z tytulem. |
 | `url` | NVARCHAR(2000), UNIQUE | RSS feed | URL artykulu (klucz deduplikacji) |
 | `category` | NVARCHAR(30), nullable | Gemini AI | POLITYKA_KRAJOWA / MAKROEKONOMIA / RPP_STOPY / GEOPOLITYKA / INNE |
 | `sentiment` | REAL, nullable | Gemini AI | -1.0 (negatywny) do 1.0 (pozytywny) |
@@ -117,14 +124,42 @@ GROUP BY SUBSTRING(f.timestamp, 1, 13)
 ORDER BY hour DESC;
 ```
 
+## Filtry newsow
+
+Pipeline stosuje trzy warstwy filtrowania:
+
+1. **Spam phrases** — naglowki zawierajace frazy z `config.yaml` (np. "artykul sponsorowany")
+2. **Stale articles** — artykuly starsze niz `max_article_age_days` (domyslnie 7 dni). Bankier.pl trzyma w RSS archiwalne artykuly z lat poprzednich.
+3. **Auto-generated FX headlines** — automatyczne raporty walutowe Money.pl (np. "Ile kosztuje euro?", "Kurs euro do zlotego PLN/EUR"). Zero wartosci informacyjnej, zawyza kategorie MAKROEKONOMIA.
+
+Tryby specjalne:
+- `--reclassify` — pobiera z bazy newsy z `category IS NULL`, przepuszcza przez Gemini (tytul + opis), robi UPDATE. Przydatne po podpieciu klucza API.
+- `--cleanup` — jednorazowo usuwa z bazy rekordy, ktore zostaly zapisane przed wdrozeniem filtrow (stale articles + auto-generated FX headlines).
+
+## Zrodla RSS
+
+| Zrodlo | Feed | Source w bazie | Description w RSS |
+|--------|------|----------------|-------------------|
+| Bankier.pl — Waluty | `waluty.xml` | bankier_waluty | tak (summary z HTML) |
+| Bankier.pl — Gielda | `gielda.xml` | bankier_gielda | tak (summary z HTML) |
+| Money.pl | `rss.xml` | money | tak (summary z HTML) |
+| Investing.com PL Economy | `news_95.rss` | investing_economy | nie — klasyfikacja tylko po tytule |
+| ISBnews.pl | — | — | feed zwraca HTTP 404 (sprawdzono 2026-02-24) |
+| PAP Biznes | — | — | brak publicznego RSS |
+
+Dwa feedy Bankiera (waluty + gielda) moga zwracac te same artykuly (np. decyzje RPP). Deduplikacja: batch-level (seen_urls) + UNIQUE constraint na URL + MERGE SQL.
+
+Pole `description` w bazie jest czyszczone z tagow HTML (`_strip_html()`) i uzywane przez Gemini razem z tytulem do klasyfikacji. Format promptu: "Tytul: {title}\nOpis: {description}". Investing.com nie dostarcza description — klasyfikacja oparta wylacznie na tytule.
+
 ## Znane ograniczenia
 
 1. **yfinance to nieoficjalne API** — moze przestac dzialac bez ostrzezenia. Yahoo Finance nie oferuje oficjalnego darmowego API.
-2. **Klasyfikacja AI (Gemini) jest przyblizona** — brak ground truth do walidacji. Model widzi tylko naglowek, nie pelny artykul.
+2. **Klasyfikacja AI (Gemini) jest przyblizona** — brak ground truth do walidacji. Model widzi naglowek + opis RSS (jesli dostepny), nie pelny artykul.
 3. **Pole `is_surprising` ma niska wiarygodnosc** — LLM nie zna konsensusu rynkowego ani oczekiwan analitykow.
 4. **Pole `volume` (tick volume)** nie odzwierciedla rzeczywistego wolumenu na rynku FX. FX jest rynkiem OTC.
-5. **Pipeline pobiera naglowki, nie pelne artykuly** — kontekst klasyfikacji jest ograniczony do tytulu.
+5. **Pipeline pobiera naglowki + opisy RSS** — kontekst klasyfikacji obejmuje tytul i opis (jesli feed go dostarcza). Bankier i Money zwracaja opisy. Investing.com nie zwraca opisu.
 6. **Tylko polskie newsy** — brak grupy kontrolnej dla newsow CZ/HU. To confounding variable w analizie spillover.
+7. **Investing.com feed zawiera newsy globalne** — PMI Mozambiku, Zambii itp. trafiaja jako INNE. Rozwazyc dodatkowy filtr CEE-only w przyszlosci.
 7. **Limit backfillu: 730 dni** — ograniczenie yfinance dla danych godzinowych (1h interval).
 8. **RSS nie wspiera paginacji wstecz** — modul newsow zawsze pobiera tylko aktualny stan feedu (ostatnie ~20-50 artykulow).
 9. **Brak formalnych testow** — walidacja przez `--fx-only`, `--news-only`, oraz manualne uruchomienia.

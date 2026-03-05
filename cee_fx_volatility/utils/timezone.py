@@ -48,7 +48,10 @@ def parse_rss_datetime(date_str: str) -> str | None:
     import email.utils
 
     # Try email.utils (handles RFC 822 well)
-    parsed = email.utils.parsedate_to_datetime(date_str) if date_str else None
+    try:
+        parsed = email.utils.parsedate_to_datetime(date_str) if date_str else None
+    except (ValueError, TypeError):
+        parsed = None
     if parsed is not None:
         return to_utc_iso(parsed)
 

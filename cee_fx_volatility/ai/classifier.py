@@ -94,9 +94,13 @@ Is_surprising: true jeśli news jest niespodziewany/nietypowy, false jeśli ruty
 
 # ── Classification ─────────────────────────────────────────────────
 
-def classify_headline(title: str) -> dict | None:
+def classify_headline(title: str, description: str | None = None) -> dict | None:
     """
     Classify a single headline using Gemini structured output.
+
+    Args:
+        title: Headline text.
+        description: Optional description/summary from RSS (improves classification).
 
     Returns:
         Dict with keys: category, sentiment, is_surprising, raw_ai_response
@@ -109,13 +113,18 @@ def classify_headline(title: str) -> dict | None:
     config = _load_config()
     model_name = config["gemini"]["model"]
 
+    if description:
+        prompt_text = f"Tytuł: {title}\nOpis: {description}"
+    else:
+        prompt_text = f"Tytuł: {title}"
+
     from google.genai import types
 
     for attempt in range(3):
         try:
             response = client.models.generate_content(
                 model=model_name,
-                contents=f"Klasyfikuj ten nagłówek: {title}",
+                contents=f"Klasyfikuj ten nagłówek:\n{prompt_text}",
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     response_mime_type="application/json",
@@ -166,9 +175,10 @@ def classify_batch(news_records: list[dict]) -> list[dict]:
 
     for i, rec in enumerate(news_records):
         title = rec.get("title", "")
+        description = rec.get("description")
         print(f"  [AI] [{i + 1}/{len(news_records)}] {title[:60]}...", end=" ", flush=True)
 
-        result = classify_headline(title)
+        result = classify_headline(title, description=description)
         if result:
             rec["category"] = result["category"]
             rec["sentiment"] = result["sentiment"]

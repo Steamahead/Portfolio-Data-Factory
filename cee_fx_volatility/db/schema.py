@@ -29,6 +29,7 @@ CREATE TABLE cee_news_headlines (
     fetched_at          NVARCHAR(30)   NOT NULL,
     source              NVARCHAR(20)   NOT NULL,
     title               NVARCHAR(1000) NOT NULL,
+    description         NVARCHAR(MAX)  NULL,
     url                 NVARCHAR(2000) NOT NULL,
     category            NVARCHAR(30)   NULL,
     sentiment           REAL           NULL,
@@ -37,6 +38,15 @@ CREATE TABLE cee_news_headlines (
     created_at          DATETIME       DEFAULT GETDATE(),
     UNIQUE (url)
 );
+"""
+
+# Migration: add description column to existing table (safe to run multiple times)
+ALTER_NEWS_ADD_DESCRIPTION_SQL = """
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID('cee_news_headlines') AND name = 'description'
+)
+ALTER TABLE cee_news_headlines ADD description NVARCHAR(MAX) NULL;
 """
 
 MERGE_FX_SQL = """
@@ -58,19 +68,22 @@ WHEN NOT MATCHED THEN INSERT
 MERGE_NEWS_SQL = """
 MERGE INTO cee_news_headlines AS T
 USING (SELECT ? AS published_at, ? AS fetched_at, ? AS source,
-              ? AS title, ? AS url, ? AS category,
+              ? AS title, ? AS description, ? AS url, ? AS category,
               ? AS sentiment, ? AS is_surprising, ? AS raw_ai_response) AS S
 ON T.url = S.url
 WHEN MATCHED THEN UPDATE SET
     published_at = S.published_at, fetched_at = S.fetched_at,
     source = S.source, title = S.title,
-    category = S.category, sentiment = S.sentiment,
-    is_surprising = S.is_surprising, raw_ai_response = S.raw_ai_response,
+    description = COALESCE(T.description, S.description),
+    category = COALESCE(T.category, S.category),
+    sentiment = COALESCE(T.sentiment, S.sentiment),
+    is_surprising = COALESCE(T.is_surprising, S.is_surprising),
+    raw_ai_response = COALESCE(T.raw_ai_response, S.raw_ai_response),
     created_at = GETDATE()
 WHEN NOT MATCHED THEN INSERT
-    (published_at, fetched_at, source, title, url,
+    (published_at, fetched_at, source, title, description, url,
      category, sentiment, is_surprising, raw_ai_response)
-    VALUES (S.published_at, S.fetched_at, S.source, S.title, S.url,
+    VALUES (S.published_at, S.fetched_at, S.source, S.title, S.description, S.url,
             S.category, S.sentiment, S.is_surprising, S.raw_ai_response);
 """
 
@@ -81,6 +94,6 @@ FX_SQL_COLUMNS = [
 ]
 
 NEWS_SQL_COLUMNS = [
-    "published_at", "fetched_at", "source", "title", "url",
+    "published_at", "fetched_at", "source", "title", "description", "url",
     "category", "sentiment", "is_surprising", "raw_ai_response",
 ]
