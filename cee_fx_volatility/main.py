@@ -152,8 +152,40 @@ def _build_success_html(result: dict) -> str:
     """
 
 
-def _send_alert(result: dict) -> None:
-    """Send email alert based on pipeline result."""
+def _build_start_html() -> str:
+    """Build HTML email body for pipeline start notification."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return f"""
+    <html><body style="font-family:Segoe UI,Arial,sans-serif;max-width:650px;">
+    <h2 style="color:#007bff;">&#9654; CEE FX Volatility — START</h2>
+    <p><strong>Czas:</strong> {ts}</p>
+    <p>Pipeline CEE FX Volatility zostal uruchomiony.</p>
+    <p style="color:gray;font-size:12px;">
+      Jesli nie otrzymasz maila FINISH w ciagu kilkunastu minut, sprawdz logi.
+    </p>
+    <p style="color:#6c757d;font-size:12px;margin-top:20px;">
+      Pipeline: cee_fx_volatility | Azure Function: CeeFxDailyRun
+    </p>
+    </body></html>
+    """
+
+
+def _send_start_email() -> None:
+    """Send pipeline start notification email."""
+    from .db.operations import _load_env
+    _load_env()
+
+    email_config = _get_email_config()
+    if not email_config:
+        return
+
+    subject = f"[START] CEE FX Pipeline ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')})"
+    body = _build_start_html()
+    _send_email(subject, body, email_config)
+
+
+def _send_finish_email(result: dict) -> None:
+    """Send email alert based on pipeline result — always sends (success or failure)."""
     # Ensure env is loaded (for Azure Function context)
     from .db.operations import _load_env
     _load_env()
@@ -166,12 +198,16 @@ def _send_alert(result: dict) -> None:
     errors = result.get("fx_errors", []) + result.get("news_errors", [])
 
     if not result["success"]:
-        subject = f"[ALERT] CEE FX Pipeline FAIL ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')})"
+        subject = f"[FAIL] CEE FX Pipeline ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')})"
         body = _build_alert_html(result, errors)
         _send_email(subject, body, email_config)
     elif errors:
         subject = f"[WARN] CEE FX Pipeline OK z bledami ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')})"
         body = _build_alert_html(result, errors)
+        _send_email(subject, body, email_config)
+    else:
+        subject = f"[SUCCESS] CEE FX Pipeline ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')})"
+        body = _build_success_html(result)
         _send_email(subject, body, email_config)
 
 
@@ -362,12 +398,6 @@ def run(backfill_days: int | None = None, fx_only: bool = False, news_only: bool
 
     print(f"  Status: {'OK' if result['success'] else 'FAIL'}")
     print(f"{'═' * 55}\n")
-
-    # Email alert on failure or errors
-    try:
-        _send_alert(result)
-    except Exception as e:
-        print(f"  [EMAIL] Blad wysylki alertu: {e}")
 
     return result
 

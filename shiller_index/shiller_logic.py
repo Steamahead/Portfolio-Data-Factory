@@ -9,10 +9,14 @@ import os
 import csv
 import json
 import logging
+import smtplib
 import time
+import traceback
 import pyodbc
 import requests
 import yfinance as yf
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from google import genai
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -53,6 +57,183 @@ def load_local_settings():
 
 # Load settings on import
 load_local_settings()
+
+# Load .env (email config lives here, not in local.settings.json)
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+if _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith("#"):
+            continue
+        if "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+
+# ── Email alerts (same pattern as cee_fx_volatility + scraper_monitor) ──
+
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+
+
+def _get_email_config() -> dict | None:
+    """Load email config from env. Returns None if not configured."""
+    email_from = os.environ.get("ALERT_EMAIL_FROM", "").strip()
+    password = os.environ.get("ALERT_EMAIL_PASSWORD", "").strip()
+    email_to = os.environ.get("ALERT_EMAIL_TO", "").strip()
+
+    if not all([email_from, password, email_to]):
+        return None
+
+    return {"from": email_from, "password": password, "to": email_to}
+
+
+def _send_email(subject: str, body_html: str, config: dict) -> bool:
+    """Send email via Gmail SMTP. Returns True on success."""
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = config["from"]
+    msg["To"] = config["to"]
+    msg.attach(MIMEText(body_html, "html", "utf-8"))
+
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(config["from"], config["password"])
+            server.sendmail(config["from"], config["to"], msg.as_string())
+        logger.info(f"[EMAIL] Alert wyslany na {config['to']}")
+        return True
+    except Exception as e:
+        logger.warning(f"[EMAIL FAIL] Nie udalo sie wyslac: {e}")
+        return False
+
+
+def _build_start_html() -> str:
+    """Build HTML email body for pipeline start notification."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    ticker_list = "".join(f"<li>{t}</li>" for t in TICKERS)
+    return f"""
+    <html><body style="font-family:Segoe UI,Arial,sans-serif;max-width:650px;">
+    <h2 style="color:#007bff;">&#9654; Shiller Hybrid Index — START</h2>
+    <p><strong>Czas:</strong> {ts}</p>
+    <p>Pipeline Shiller Hybrid Index zostal uruchomiony. Tickery:</p>
+    <ul>{ticker_list}</ul>
+    <p style="color:gray;font-size:12px;">
+      Jesli nie otrzymasz maila FINISH w ciagu kilkunastu minut, sprawdz logi.
+    </p>
+    <p style="color:#6c757d;font-size:12px;margin-top:20px;">
+      Pipeline: shiller_index | Azure Function: ShillerDailyRun
+    </p>
+    </body></html>
+    """
+
+
+def _build_shiller_success_html(results: list[dict]) -> str:
+    """Build HTML email body for pipeline success report."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    ticker_rows = ""
+    for r in results:
+        meta = r["metadata"]
+        agg = r["aggregated_scores"]
+        ticker_rows += f"""
+      <tr>
+        <td style="padding:6px 12px;border:1px solid #ddd;">{meta['ticker']}</td>
+        <td style="padding:6px 12px;border:1px solid #ddd;">${meta['price']}</td>
+        <td style="padding:6px 12px;border:1px solid #ddd;">{agg['final_sentiment']}</td>
+        <td style="padding:6px 12px;border:1px solid #ddd;">{agg['final_hype']}</td>
+        <td style="padding:6px 12px;border:1px solid #ddd;">{agg['sentiment_confidence']}</td>
+      </tr>"""
+
+    return f"""
+    <html><body style="font-family:Segoe UI,Arial,sans-serif;max-width:650px;">
+    <h2 style="color:#28a745;">&#9989; Shiller Hybrid Index — OK</h2>
+    <p><strong>Czas:</strong> {ts}</p>
+    <p><strong>Przetworzono:</strong> {len(results)}/{len(TICKERS)} tickerow</p>
+
+    <table style="border-collapse:collapse;width:100%;margin:10px 0;">
+      <tr style="background:#f8f9fa;">
+        <th style="padding:6px 12px;border:1px solid #ddd;">Ticker</th>
+        <th style="padding:6px 12px;border:1px solid #ddd;">Cena</th>
+        <th style="padding:6px 12px;border:1px solid #ddd;">Sentiment</th>
+        <th style="padding:6px 12px;border:1px solid #ddd;">Hype</th>
+        <th style="padding:6px 12px;border:1px solid #ddd;">Confidence</th>
+      </tr>
+      {ticker_rows}
+    </table>
+
+    <p style="color:#6c757d;font-size:12px;margin-top:20px;">
+      Pipeline: shiller_index | Azure Function: ShillerDailyRun
+    </p>
+    </body></html>
+    """
+
+
+def _build_shiller_alert_html(results: list[dict], failed_tickers: list, error_msg: str | None = None) -> str:
+    """Build HTML email body for pipeline failure alert."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    error_section = ""
+    if error_msg:
+        error_section = f'<p style="color:#dc3545;"><strong>Blad:</strong> {error_msg}</p>'
+
+    failed_info = ""
+    if failed_tickers:
+        items = "".join(f"<li>{t} — {e}</li>" for t, e, _ in failed_tickers)
+        failed_info = f"""
+        <h3 style="color:#dc3545;">Nieudane tickery:</h3>
+        <ul>{items}</ul>
+        """
+
+    return f"""
+    <html><body style="font-family:Segoe UI,Arial,sans-serif;max-width:650px;">
+    <h2 style="color:#dc3545;">&#128680; Shiller Hybrid Index — Alert</h2>
+    <p><strong>Czas:</strong> {ts}</p>
+    <p><strong>Przetworzono:</strong> {len(results)}/{len(TICKERS)} tickerow</p>
+    {error_section}
+    {failed_info}
+
+    <p style="color:#6c757d;font-size:12px;margin-top:20px;">
+      Pipeline: shiller_index | Azure Function: ShillerDailyRun
+    </p>
+    </body></html>
+    """
+
+
+def _send_shiller_start_email() -> None:
+    """Send pipeline start notification email."""
+    email_config = _get_email_config()
+    if not email_config:
+        return
+
+    subject = f"[START] Shiller Index ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')})"
+    body = _build_start_html()
+    _send_email(subject, body, email_config)
+
+
+def _send_shiller_finish_email(results: list[dict], failed_tickers: list | None = None,
+                               error_msg: str | None = None) -> None:
+    """Send email with pipeline result — always sends."""
+    email_config = _get_email_config()
+    if not email_config:
+        logger.info("[EMAIL] Brak konfiguracji email — pomijam alert")
+        return
+
+    if error_msg:
+        subject = f"[FAIL] Shiller Index ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')})"
+        body = _build_shiller_alert_html(results, failed_tickers or [], error_msg=error_msg)
+        _send_email(subject, body, email_config)
+    elif failed_tickers:
+        subject = f"[WARN] Shiller Index — {len(results)}/{len(TICKERS)} OK ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')})"
+        body = _build_shiller_alert_html(results, failed_tickers)
+        _send_email(subject, body, email_config)
+    else:
+        subject = f"[SUCCESS] Shiller Index ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')})"
+        body = _build_shiller_success_html(results)
+        _send_email(subject, body, email_config)
+
 
 # Configure Gemini client
 api_key = os.environ.get("GEMINI_API_KEY")
@@ -282,21 +463,26 @@ def calculate_quality_scores(article: dict) -> dict:
         val = metrics.get(key, 0)
         return val if val is not None else 0
 
-    # Quality for Sentiment (max 100)
+    # Quality for Sentiment (max 100): 15 + 35 + 15 + 35
     quality_sentiment = (
-        safe_get("centrality") +
-        safe_get("credibility_sentiment") +
-        safe_get("recency") +
-        safe_get("materiality")
+        min(safe_get("centrality"), 15) +
+        min(safe_get("credibility_sentiment"), 35) +
+        min(safe_get("recency"), 15) +
+        min(safe_get("materiality"), 35)
     )
 
-    # Quality for Hype (max 100) - SPECULATION SIGNAL IS WEIGHT!
+    # Quality for Hype (max 100): 15 + 10 + 15 + 60
     quality_hype = (
-        safe_get("centrality") +
-        safe_get("credibility_hype") +
-        safe_get("recency") +
-        safe_get("speculation_signal")
+        min(safe_get("centrality"), 15) +
+        min(safe_get("credibility_hype"), 10) +
+        min(safe_get("recency"), 15) +
+        min(safe_get("speculation_signal"), 60)
     )
+
+    if quality_sentiment > 100:
+        logger.warning(f"quality_sentiment exceeded 100: {quality_sentiment}")
+    if quality_hype > 100:
+        logger.warning(f"quality_hype exceeded 100: {quality_hype}")
 
     return {
         "quality_sentiment": quality_sentiment,
@@ -687,6 +873,12 @@ def _process_single_ticker(ticker: str) -> tuple[dict | None, str | None]:
 
 def run_shiller_analysis() -> list[dict]:
     """Run the full Shiller Hybrid Index analysis for all tickers with retry logic."""
+    # Email START
+    try:
+        _send_shiller_start_email()
+    except Exception as e:
+        logger.warning(f"[EMAIL] Blad wysylki START: {e}")
+
     results = []
     # Track failures with their analysis results (for DB-only retries)
     failed_tickers: list[tuple[str, str, dict | None]] = []  # (ticker, error_type, analysis_result)
@@ -744,6 +936,13 @@ def run_shiller_analysis() -> list[dict]:
             logger.error(f"❌ Permanently failed tickers after all retries: {[(t, e) for t, e, _ in still_failed]}")
 
     logger.info(f"✅ Successfully processed {len(results)}/{len(TICKERS)} tickers")
+
+    # Email FINISH (always — success, warning, or failure)
+    try:
+        _send_shiller_finish_email(results, failed_tickers if failed_tickers else None)
+    except Exception as e:
+        logger.warning(f"[EMAIL] Blad wysylki FINISH: {e}")
+
     return results
 
 
