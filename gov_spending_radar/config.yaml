@@ -106,3 +106,8 @@ sector_priority:
   - CONSTRUCTION
   - MEDICAL
   - ENERGY
+
+# ── Gemini LLM classifier settings ────────────────────────────────
+gemini:
+  model: "gemini-2.5-flash"
+  classify_delay_seconds: 1.0

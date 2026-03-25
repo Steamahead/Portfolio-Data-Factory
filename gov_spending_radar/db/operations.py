@@ -19,7 +19,9 @@ from .schema import (
     CREATE_CONTRACTORS_TABLE_SQL,
     CREATE_CLASSIFICATIONS_TABLE_SQL,
     MIGRATE_NOTICES_SQL,
+    MIGRATE_NOTICES_HTML_FIELDS_SQL,
     MIGRATE_CONTRACTORS_SQL,
+    MIGRATE_CLASSIFICATIONS_V2_SQL,
     MERGE_NOTICES_SQL,
     MERGE_CONTRACTORS_SQL,
     MERGE_CLASSIFICATIONS_SQL,
@@ -118,8 +120,9 @@ def upload_notices(records: list[dict]) -> dict:
                 cursor = conn.cursor()
                 cursor.execute(CREATE_NOTICES_TABLE_SQL)
                 cursor.execute(MIGRATE_NOTICES_SQL)
+                cursor.execute(MIGRATE_NOTICES_HTML_FIELDS_SQL)
                 conn.commit()
-                print("  [SQL] Tabela gov_notices — OK")
+                print("  [SQL] Tabela gov_notices — OK (HTML fields migration applied)")
 
                 uploaded = 0
                 row_errors = []
@@ -233,8 +236,9 @@ def upload_classifications(records: list[dict]) -> dict:
             with _connect_with_retry() as conn:
                 cursor = conn.cursor()
                 cursor.execute(CREATE_CLASSIFICATIONS_TABLE_SQL)
+                cursor.execute(MIGRATE_CLASSIFICATIONS_V2_SQL)
                 conn.commit()
-                print("  [SQL] Tabela gov_classifications — OK")
+                print("  [SQL] Tabela gov_classifications — OK (v2 migration applied)")
 
                 uploaded = 0
                 row_errors = []
@@ -270,14 +274,14 @@ def upload_classifications(records: list[dict]) -> dict:
 
 def fetch_unclassified_notices() -> list[dict]:
     """
-    Fetch notices that have no classification yet (for --classify mode).
-    Returns list of dicts with object_id, title, cpv_code, cpv_raw.
+    Fetch notices that have no classification yet (for --classify mode, CPV+keyword pass).
+    Returns list of dicts with object_id, title, cpv_code, cpv_raw, buyer_name.
     """
     try:
         with _connect_with_retry() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT n.object_id, n.title, n.cpv_code, n.cpv_raw
+                SELECT n.object_id, n.title, n.cpv_code, n.cpv_raw, n.buyer_name
                 FROM gov_notices n
                 WHERE NOT EXISTS (
                     SELECT 1 FROM gov_classifications c
@@ -286,9 +290,101 @@ def fetch_unclassified_notices() -> list[dict]:
             """)
             rows = cursor.fetchall()
             return [
-                {"object_id": r[0], "title": r[1], "cpv_code": r[2], "cpv_raw": r[3]}
+                {
+                    "object_id": r[0], "title": r[1], "cpv_code": r[2],
+                    "cpv_raw": r[3], "buyer_name": r[4],
+                }
                 for r in rows
             ]
     except Exception as e:
         print(f"  [SQL] Błąd pobierania niesklasyfikowanych ogłoszeń: {e}")
+        return []
+
+
+def delete_all_classifications() -> int:
+    """
+    Delete all rows from gov_classifications. Used by reclassify_all script.
+    Returns number of deleted rows.
+    """
+    try:
+        with _connect_with_retry() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM gov_classifications")
+            deleted = cursor.rowcount
+            conn.commit()
+            print(f"  [SQL] Usunięto {deleted} klasyfikacji")
+            return deleted
+    except Exception as e:
+        print(f"  [SQL] Błąd usuwania klasyfikacji: {e}")
+        return 0
+
+
+def fetch_all_notices_for_classification() -> list[dict]:
+    """
+    Fetch ALL notices from gov_notices for full reclassification.
+    Returns list of dicts with object_id, title, cpv_code, cpv_raw, buyer_name.
+    """
+    try:
+        with _connect_with_retry() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT object_id, title, cpv_code, cpv_raw, buyer_name
+                FROM gov_notices
+            """)
+            rows = cursor.fetchall()
+            print(f"  [SQL] Pobrano {len(rows)} ogłoszeń do klasyfikacji")
+            return [
+                {
+                    "object_id": r[0], "title": r[1], "cpv_code": r[2],
+                    "cpv_raw": r[3], "buyer_name": r[4],
+                }
+                for r in rows
+            ]
+    except Exception as e:
+        print(f"  [SQL] Błąd pobierania ogłoszeń: {e}")
+        return []
+
+
+def run_schema_migration() -> None:
+    """Run all schema migrations (safe to call multiple times)."""
+    try:
+        with _connect_with_retry() as conn:
+            cursor = conn.cursor()
+            cursor.execute(CREATE_CLASSIFICATIONS_TABLE_SQL)
+            cursor.execute(MIGRATE_CLASSIFICATIONS_V2_SQL)
+            conn.commit()
+            print("  [SQL] Schema migration v2 — OK")
+    except Exception as e:
+        print(f"  [SQL] Błąd migracji: {e}")
+        raise
+
+
+def fetch_unclassified_for_llm() -> list[dict]:
+    """
+    Fetch notices that have no LLM classification yet (may have cpv_keyword).
+    For --classify LLM pass.
+    Returns list of dicts with object_id, title, cpv_code, cpv_raw, buyer_name.
+    """
+    try:
+        with _connect_with_retry() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT n.object_id, n.title, n.cpv_code, n.cpv_raw, n.buyer_name
+                FROM gov_notices n
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM gov_classifications c
+                    WHERE c.notice_object_id = n.object_id
+                      AND c.method = 'llm_gemini'
+                )
+            """)
+            rows = cursor.fetchall()
+            return [
+                {
+                    "object_id": r[0], "title": r[1], "cpv_code": r[2],
+                    "cpv_raw": r[3], "buyer_name": r[4],
+                }
+                for r in rows
+            ]
+    except Exception as e:
+        print(f"  [SQL] Błąd pobierania ogłoszeń do klasyfikacji LLM: {e}")
         return []

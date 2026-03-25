@@ -23,6 +23,8 @@ import requests
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
+from .html_parser import parse_notice_html
+
 BASE_URL = "https://ezamowienia.gov.pl/mo-board/api/v1/notice"
 
 # Notice types we collect (ContractPerformingNotice skipped per Phase 1 decision)
@@ -97,6 +99,7 @@ def _parse_iso_datetime(dt_str: str | None) -> str | None:
 
 def _transform_notice(raw: dict[str, Any]) -> dict[str, Any]:
     """Transform raw API notice into SQL-ready dict matching NOTICES_SQL_COLUMNS."""
+    html_fields = raw.get("_html_fields") or {}
     return {
         "object_id": raw.get("objectId"),
         "notice_number": raw.get("noticeNumber"),
@@ -119,6 +122,15 @@ def _transform_notice(raw: dict[str, Any]) -> dict[str, Any]:
         "buyer_country": raw.get("organizationCountry"),
         "buyer_nip": _normalize_nip(raw.get("organizationNationalId")),
         "buyer_org_id": raw.get("organizationId"),
+        # HTML-parsed fields (inline extraction, raw HTML discarded)
+        "budget_estimated": html_fields.get("budget_estimated"),
+        "final_price": html_fields.get("final_price"),
+        "offers_count": html_fields.get("offers_count"),
+        "lowest_price": html_fields.get("lowest_price"),
+        "highest_price": html_fields.get("highest_price"),
+        "contract_value": html_fields.get("contract_value"),
+        "currency": html_fields.get("currency"),
+        "description": html_fields.get("description"),
     }
 
 
@@ -164,7 +176,7 @@ def _fetch_page(
 ) -> list[dict]:
     """
     Fetch a single page of notices from BZP API.
-    Returns list of raw notice dicts (without htmlBody).
+    Parses htmlBody inline (extracts fields, discards raw HTML).
     Retries up to MAX_HTTP_RETRIES times on failure.
     """
     params = {
@@ -180,9 +192,10 @@ def _fetch_page(
             resp.raise_for_status()
             data = resp.json()
             notices = data if isinstance(data, list) else data.get("notices", [])
-            # Strip htmlBody to save memory
+            # Parse htmlBody inline → extract fields → discard raw HTML
             for n in notices:
-                n.pop("htmlBody", None)
+                html = n.pop("htmlBody", None)
+                n["_html_fields"] = parse_notice_html(html, notice_type)
             return notices
         except requests.RequestException as e:
             if attempt < MAX_HTTP_RETRIES - 1:

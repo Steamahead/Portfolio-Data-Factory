@@ -65,12 +65,12 @@ IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'gov_classifications')
 CREATE TABLE gov_classifications (
     id                      INT IDENTITY(1,1) PRIMARY KEY,
     notice_object_id        NVARCHAR(50)    NOT NULL,
-    method                  NVARCHAR(20)    NOT NULL,
+    method                  NVARCHAR(30)    NOT NULL,
     sector                  NVARCHAR(30)    NULL,
     confidence              REAL            NULL,
     raw_response            NVARCHAR(MAX)   NULL,
     classified_at           DATETIME        DEFAULT GETDATE(),
-    UNIQUE (notice_object_id, method)
+    UNIQUE (notice_object_id, method, sector)
 );
 """
 
@@ -85,7 +85,10 @@ USING (SELECT ? AS object_id, ? AS notice_number, ? AS bzp_number,
               ? AS procedure_result, ? AS is_below_eu_threshold,
               ? AS client_type, ? AS tender_type,
               ? AS buyer_name, ? AS buyer_city, ? AS buyer_province,
-              ? AS buyer_country, ? AS buyer_nip, ? AS buyer_org_id) AS S
+              ? AS buyer_country, ? AS buyer_nip, ? AS buyer_org_id,
+              ? AS budget_estimated, ? AS final_price,
+              ? AS offers_count, ? AS lowest_price, ? AS highest_price,
+              ? AS contract_value, ? AS currency, ? AS description) AS S
 ON T.object_id = S.object_id
 WHEN MATCHED THEN UPDATE SET
     notice_number = S.notice_number, bzp_number = S.bzp_number,
@@ -98,18 +101,30 @@ WHEN MATCHED THEN UPDATE SET
     buyer_name = S.buyer_name, buyer_city = S.buyer_city,
     buyer_province = S.buyer_province, buyer_country = S.buyer_country,
     buyer_nip = S.buyer_nip, buyer_org_id = S.buyer_org_id,
+    budget_estimated = COALESCE(S.budget_estimated, T.budget_estimated),
+    final_price = COALESCE(S.final_price, T.final_price),
+    offers_count = COALESCE(S.offers_count, T.offers_count),
+    lowest_price = COALESCE(S.lowest_price, T.lowest_price),
+    highest_price = COALESCE(S.highest_price, T.highest_price),
+    contract_value = COALESCE(S.contract_value, T.contract_value),
+    currency = COALESCE(S.currency, T.currency),
+    description = COALESCE(S.description, T.description),
     created_at = GETDATE()
 WHEN NOT MATCHED THEN INSERT
     (object_id, notice_number, bzp_number, tender_id, notice_type,
      title, cpv_code, cpv_raw, order_type, publication_date, deadline_date,
      procedure_result, is_below_eu_threshold, client_type, tender_type,
      buyer_name, buyer_city, buyer_province, buyer_country,
-     buyer_nip, buyer_org_id)
+     buyer_nip, buyer_org_id,
+     budget_estimated, final_price, offers_count, lowest_price, highest_price,
+     contract_value, currency, description)
     VALUES (S.object_id, S.notice_number, S.bzp_number, S.tender_id, S.notice_type,
             S.title, S.cpv_code, S.cpv_raw, S.order_type, S.publication_date,
             S.deadline_date, S.procedure_result, S.is_below_eu_threshold,
             S.client_type, S.tender_type, S.buyer_name, S.buyer_city,
-            S.buyer_province, S.buyer_country, S.buyer_nip, S.buyer_org_id);
+            S.buyer_province, S.buyer_country, S.buyer_nip, S.buyer_org_id,
+            S.budget_estimated, S.final_price, S.offers_count, S.lowest_price,
+            S.highest_price, S.contract_value, S.currency, S.description);
 """
 
 # ── MERGE: gov_contractors (upsert on notice_object_id + part_index) ─
@@ -141,7 +156,7 @@ MERGE_CLASSIFICATIONS_SQL = """
 MERGE INTO gov_classifications AS T
 USING (SELECT ? AS notice_object_id, ? AS method,
               ? AS sector, ? AS confidence, ? AS raw_response) AS S
-ON T.notice_object_id = S.notice_object_id AND T.method = S.method
+ON T.notice_object_id = S.notice_object_id AND T.method = S.method AND T.sector = S.sector
 WHEN MATCHED THEN UPDATE SET
     sector = S.sector, confidence = S.confidence,
     raw_response = S.raw_response, classified_at = GETDATE()
@@ -158,6 +173,8 @@ NOTICES_SQL_COLUMNS = [
     "deadline_date", "procedure_result", "is_below_eu_threshold",
     "client_type", "tender_type", "buyer_name", "buyer_city",
     "buyer_province", "buyer_country", "buyer_nip", "buyer_org_id",
+    "budget_estimated", "final_price", "offers_count", "lowest_price",
+    "highest_price", "contract_value", "currency", "description",
 ]
 
 CONTRACTORS_SQL_COLUMNS = [
@@ -199,4 +216,75 @@ IF EXISTS (SELECT 1 FROM sys.columns
            WHERE object_id = OBJECT_ID('gov_contractors') AND name = 'contractor_nip'
            AND max_length < 100)
     ALTER TABLE gov_contractors ALTER COLUMN contractor_nip NVARCHAR(50) NULL;
+"""
+
+MIGRATE_NOTICES_HTML_FIELDS_SQL = """
+-- Add columns for HTML-parsed fields (offers_count, prices, description)
+-- budget_estimated and final_price already exist (were always NULL before HTML parser)
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('gov_notices') AND name = 'offers_count')
+    ALTER TABLE gov_notices ADD offers_count SMALLINT NULL;
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('gov_notices') AND name = 'lowest_price')
+    ALTER TABLE gov_notices ADD lowest_price DECIMAL(18,2) NULL;
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('gov_notices') AND name = 'highest_price')
+    ALTER TABLE gov_notices ADD highest_price DECIMAL(18,2) NULL;
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('gov_notices') AND name = 'contract_value')
+    ALTER TABLE gov_notices ADD contract_value DECIMAL(18,2) NULL;
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('gov_notices') AND name = 'currency')
+    ALTER TABLE gov_notices ADD currency NVARCHAR(5) NULL;
+
+IF NOT EXISTS (SELECT 1 FROM sys.columns
+               WHERE object_id = OBJECT_ID('gov_notices') AND name = 'description')
+    ALTER TABLE gov_notices ADD description NVARCHAR(500) NULL;
+"""
+
+MIGRATE_CLASSIFICATIONS_V2_SQL = """
+-- V2: multi-label support — change UNIQUE from (notice_object_id, method) to (notice_object_id, method, sector)
+-- Also widen method from NVARCHAR(20) to NVARCHAR(30)
+
+-- Step 1: widen method column if needed
+IF EXISTS (SELECT 1 FROM sys.columns
+           WHERE object_id = OBJECT_ID('gov_classifications') AND name = 'method'
+           AND max_length < 60)
+    ALTER TABLE gov_classifications ALTER COLUMN method NVARCHAR(30) NOT NULL;
+
+-- Step 2: drop old 2-column unique constraint if it exists
+DECLARE @old_constraint NVARCHAR(200);
+SELECT @old_constraint = i.name
+FROM sys.indexes i
+JOIN sys.index_columns ic1 ON i.object_id = ic1.object_id AND i.index_id = ic1.index_id
+JOIN sys.index_columns ic2 ON i.object_id = ic2.object_id AND i.index_id = ic2.index_id
+WHERE i.object_id = OBJECT_ID('gov_classifications')
+  AND i.is_unique = 1
+  AND ic1.column_id = (SELECT column_id FROM sys.columns WHERE object_id = OBJECT_ID('gov_classifications') AND name = 'notice_object_id')
+  AND ic2.column_id = (SELECT column_id FROM sys.columns WHERE object_id = OBJECT_ID('gov_classifications') AND name = 'method')
+  AND (SELECT COUNT(*) FROM sys.index_columns ic WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id) = 2;
+
+IF @old_constraint IS NOT NULL
+BEGIN
+    EXEC('ALTER TABLE gov_classifications DROP CONSTRAINT [' + @old_constraint + ']');
+    PRINT 'Dropped old 2-column unique constraint: ' + @old_constraint;
+END
+
+-- Step 3: add new 3-column unique constraint if not exists
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes i
+    WHERE i.object_id = OBJECT_ID('gov_classifications')
+      AND i.is_unique = 1
+      AND (SELECT COUNT(*) FROM sys.index_columns ic WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id) = 3
+)
+BEGIN
+    ALTER TABLE gov_classifications ADD CONSTRAINT UQ_classifications_v2
+        UNIQUE (notice_object_id, method, sector);
+    PRINT 'Added new 3-column unique constraint UQ_classifications_v2';
+END
 """

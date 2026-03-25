@@ -12,3 +12,4 @@ pyodbc
 openpyxl
 feedparser
 pyyaml
+beautifulsoup4
