@@ -17,10 +17,15 @@ __pycache__/
 *.xlsx
 
 
-# --- IDE (PyCharm / VS Code) ---
+# --- IDE / TOOLING ---
 .idea/
 .vscode/
+.agents/
+.claude/
 *.swp
+
+# --- RECON / SAMPLE DATA ---
+gov_spending_radar/recon_html/
 
 # --- AZURE FUNCTIONS ---
 bin/
