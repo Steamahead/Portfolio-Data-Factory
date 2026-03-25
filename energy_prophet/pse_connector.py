@@ -332,22 +332,24 @@ class PSEConnector:
             # Prefer kse-load forecast, fallback to pk5l-wp
             demand_fcst = load.get('demand_fcst') or fcst.get('demand_fcst_pk5l')
 
-            swm_total = float(r.get('swm_p') or 0) + float(r.get('swm_np') or 0)
+            swm_p = self._clean_float(r.get('swm_p')) or 0
+            swm_np = self._clean_float(r.get('swm_np')) or 0
+            swm_total = swm_p + swm_np
 
             cursor.execute(sql,
                 r['dtime'],
                 r['business_date'],
-                r.get('pv'),
-                r.get('wi'),
-                r.get('jg'),
-                r.get('demand'),
+                self._clean_float(r.get('pv')),
+                self._clean_float(r.get('wi')),
+                self._clean_float(r.get('jg')),
+                self._clean_float(r.get('demand')),
                 swm_total,
-                demand_fcst,
-                fcst.get('wi_fcst'),
-                fcst.get('pv_fcst'),
-                r.get('jnwrb'),  # jednostki niezgłoszone (unregistered units)
-                r.get('jgm'),    # magazyny (storage)
-                r.get('jgo'),    # inne OZE (other renewables)
+                self._clean_float(demand_fcst),
+                self._clean_float(fcst.get('wi_fcst')),
+                self._clean_float(fcst.get('pv_fcst')),
+                self._clean_float(r.get('jnwrb')),  # jednostki niezgłoszone (unregistered units)
+                self._clean_float(r.get('jgm')),    # magazyny (storage)
+                self._clean_float(r.get('jgo')),    # inne OZE (other renewables)
             )
 
     def _upsert_power_balance(self, cursor, reserves: pd.DataFrame,
@@ -375,11 +377,11 @@ class PSEConnector:
                     # Bierzemy max niedoboru i max ograniczeń w oknie szczytu
                     plan_agg[peak]['rez_under'] = max(
                         plan_agg[peak].get('rez_under', 0),
-                        float(r.get('rez_under') or 0)
+                        self._clean_float(r.get('rez_under')) or 0
                     )
                     plan_agg[peak]['ogr_mwe'] = max(
                         plan_agg[peak].get('ogr_mwe', 0),
-                        float(r.get('ogr_mwe') or 0)
+                        self._clean_float(r.get('ogr_mwe')) or 0
                     )
 
         sql = """
@@ -415,14 +417,14 @@ class PSEConnector:
                 r['business_date'],
                 peak_type,
                 r.get('peak_hour'),
-                r.get('rez'),
-                r.get('rez_jgw_wir'),
-                r.get('rez_jgw_zim'),
-                r.get('rez_jgm'),
-                r.get('demand'),
-                r.get('swm'),
-                plan.get('rez_under'),
-                plan.get('ogr_mwe')
+                self._clean_float(r.get('rez')),
+                self._clean_float(r.get('rez_jgw_wir')),
+                self._clean_float(r.get('rez_jgw_zim')),
+                self._clean_float(r.get('rez_jgm')),
+                self._clean_float(r.get('demand')),
+                self._clean_float(r.get('swm')),
+                self._clean_float(plan.get('rez_under')),
+                self._clean_float(plan.get('ogr_mwe'))
             )
 
     def _upsert_flows(self, cursor, df: pd.DataFrame):
@@ -629,9 +631,32 @@ class PSEConnector:
                            )
 
 # Entry point
+def _load_local_settings():
+    """Load local.settings.json into os.environ for CLI usage."""
+    import json
+    from pathlib import Path
+    for p in [Path(__file__).parent.parent / "local.settings.json", Path("local.settings.json")]:
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                for k, v in json.load(f).get("Values", {}).items():
+                    if k not in os.environ:
+                        os.environ[k] = v
+            logging.info(f"Loaded settings from {p}")
+            return
+    logging.warning("local.settings.json not found, using existing environment variables.")
+
+
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="PSE Energy ETL")
+    parser.add_argument("--date", type=str, default=None,
+                        help="Run date (YYYY-MM-DD). Default: today")
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
-    PSEConnector().run_etl(datetime.date.today())
+    _load_local_settings()
+    run_date = datetime.date.fromisoformat(args.date) if args.date else datetime.date.today()
+    PSEConnector().run_etl(run_date)
 
 if __name__ == "__main__":
     main()
