@@ -82,6 +82,7 @@ CATEGORIES = {
 MAX_PAGES = 10  # max stron paginacji per kategoria (50 ofert/strone)
 TOP_N = 0       # 0 = bez limitu, pobieraj wszystkie oferty
 OUTPUT_CSV = "pracuj_premium_data.csv"
+KNOWN_OFFERS_FILE = SCRAPER_DIR / "pracuj_known_offers.json"
 
 def get_output_path() -> str:
     """Zwraca ścieżkę do CSV. Jeśli plik zablokowany, dodaje timestamp."""
@@ -116,6 +117,24 @@ def _extract_offer_id(url: str) -> str:
 
 def polite_delay(min_s: float = 2.0, max_s: float = 4.0):
     time.sleep(random.uniform(min_s, max_s))
+
+
+def load_known_offers() -> dict[str, str]:
+    """Ładuje cache znanych offer_id → timestamp z JSON."""
+    if KNOWN_OFFERS_FILE.exists():
+        try:
+            return json.loads(KNOWN_OFFERS_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, Exception):
+            return {}
+    return {}
+
+
+def save_known_offers(known: dict[str, str]):
+    """Zapisuje cache znanych offer_id → timestamp do JSON."""
+    KNOWN_OFFERS_FILE.write_text(
+        json.dumps(known, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def handle_cookie_consent(page) -> bool:
@@ -707,12 +726,13 @@ def upload_to_azure_sql(df: pd.DataFrame) -> dict:
 # Main
 # ===================================================================
 
-def run(progress_callback=None) -> dict:
+def run(progress_callback=None, full_mode: bool = False) -> dict:
     """
     Uruchamia scraper i zwraca strukturyzowany wynik.
 
     Args:
         progress_callback: Optional callback(current, total, phase) for progress tracking.
+        full_mode: Jeśli True, pomija cache i pobiera detale wszystkich ofert.
 
     Zwraca dict z kluczami:
       - success: bool
@@ -723,9 +743,13 @@ def run(progress_callback=None) -> dict:
       - output_path: str | None
       - timestamp: str
     """
+    incremental = not full_mode
+
     result = {
         "success": False,
         "total_offers": 0,
+        "new_offers": 0,
+        "skipped_known": 0,
         "sql_uploaded": 0,
         "categories_ok": [],
         "categories_empty": [],
@@ -735,77 +759,119 @@ def run(progress_callback=None) -> dict:
     }
 
     print("=" * 70)
-    print("  Pracuj.pl  Premium Scraper v3  -  Portfolio Data Factory")
+    print("  Pracuj.pl  Premium Scraper v4  -  Portfolio Data Factory")
     print("  Faza 1: Listing (headless) → URL-e")
-    print("  Faza 2: Detail  (headed)   → pełne dane")
+    print("  Faza 2: Detail  (headed)   → pełne dane (TYLKO NOWE)")
     print(f"  Data:       {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"  Kategorie:  {len(CATEGORIES)} ({', '.join(CATEGORIES.keys())})")
+    print(f"  Tryb:       {'PELNY (--full)' if full_mode else 'INKREMENTALNY'}")
     print(f"  Paginacja:  WSZYSTKIE oferty (max {MAX_PAGES} stron per kat.)")
     print("=" * 70)
 
     try:
         with sync_playwright() as p:
-            # FAZA 1
+            # FAZA 1 — listing (szybkie, headless)
             stubs = phase1_collect_urls(p)
             if not stubs:
                 result["errors"].append("Faza 1: nie zebrano żadnych URL-i")
                 print("\n[FAIL] Nie zebrano żadnych URL-i.")
                 return result
 
+            # Zapisz listing count PRZED filtrowaniem
+            result["total_offers"] = len(stubs)
+
+            # --- Filtracja known offers (tryb inkrementalny) ---
+            known_offers = {}
+            if incremental:
+                known_offers = load_known_offers()
+                if known_offers:
+                    total_before = len(stubs)
+                    stubs_new = [s for s in stubs if s["offer_id"] not in known_offers]
+                    skipped = total_before - len(stubs_new)
+                    result["skipped_known"] = skipped
+                    print(f"\n[INCREMENTAL] Znanych ofert: {skipped}, nowych do pobrania: {len(stubs_new)}")
+                    for cat in CATEGORIES:
+                        cat_new = [s for s in stubs_new if s["category"] == cat]
+                        if cat_new:
+                            print(f"  {cat:25s}  {len(cat_new)} nowych")
+                    stubs = stubs_new
+                else:
+                    print(f"\n[INCREMENTAL] Brak cache — pierwsze uruchomienie, pobieram wszystko")
+
+            if not stubs and incremental and known_offers:
+                print(f"\n[OK] Brak nowych ofert — wszystkie {result['total_offers']} już znane.")
+                result["success"] = True
+                result["new_offers"] = 0
+                for cat in CATEGORIES:
+                    result["categories_ok"].append(cat)
+                save_known_offers(known_offers)
+                return result
+
             if progress_callback:
                 progress_callback(0, len(stubs), "listings_done")
 
-            # FAZA 2
+            # FAZA 2 — tylko nowe oferty (wolne, headed)
             all_rows = phase2_deep_dive(p, stubs, progress_callback=progress_callback)
     except Exception as e:
         result["errors"].append(f"Krytyczny wyjątek: {e}")
         print(f"\n[FAIL] Krytyczny wyjątek: {e}")
         return result
 
-    if not all_rows:
+    if not all_rows and not (incremental and known_offers):
         result["errors"].append("Faza 2: nie udało się pobrać żadnych ofert")
         print("\n[FAIL] Nie udało się pobrać żadnych ofert.")
         return result
 
     # --- Zapis do CSV ---
-    df = pd.DataFrame(all_rows)
+    if all_rows:
+        df = pd.DataFrame(all_rows)
 
-    # Uzupełnij brakujące kolumny dla ofert które failowały
-    for col in [
-        "Location", "Salary_UoP", "Salary_B2B",
-        "Skills_Required", "Skills_Nice_To_Have",
-        "Requirements_Expected", "Requirements_Nice_To_Have",
-        "Body_HTML", "Position_Level", "Contract_Types",
-        "Work_Mode", "Pracuj_Category", "Published_At",
-    ]:
-        if col not in df.columns:
-            df[col] = ""
+        # Uzupełnij brakujące kolumny dla ofert które failowały
+        for col in [
+            "Location", "Salary_UoP", "Salary_B2B",
+            "Skills_Required", "Skills_Nice_To_Have",
+            "Requirements_Expected", "Requirements_Nice_To_Have",
+            "Body_HTML", "Position_Level", "Contract_Types",
+            "Work_Mode", "Pracuj_Category", "Published_At",
+        ]:
+            if col not in df.columns:
+                df[col] = ""
 
-    output_path = get_output_path()
-    df.to_csv(output_path, index=False, encoding="utf-8-sig")
-    result["output_path"] = output_path
+        output_path = get_output_path()
+        df.to_csv(output_path, index=False, encoding="utf-8-sig")
+        result["output_path"] = output_path
 
-    # --- Upload do Azure SQL ---
-    sql_result = upload_to_azure_sql(df)
-    result["sql_uploaded"] = sql_result["uploaded"]
-    if sql_result["errors"]:
-        result["errors"].extend(sql_result["errors"])
+        # --- Upload do Azure SQL ---
+        sql_result = upload_to_azure_sql(df)
+        result["sql_uploaded"] = sql_result["uploaded"]
+        if sql_result["errors"]:
+            result["errors"].extend(sql_result["errors"])
 
-    # --- Statystyki per kategoria ---
-    result["total_offers"] = len(df)
+        result["new_offers"] = len(df)
+    else:
+        df = pd.DataFrame()
+
+    # --- Aktualizuj cache znanych ofert ---
+    if incremental:
+        # Dodaj nowe offer_id do cache
+        for row in all_rows:
+            oid = row.get("Offer_ID", "")
+            if oid:
+                known_offers[oid] = row.get("Scraped_At", "")
+        save_known_offers(known_offers)
+        print(f"  Cache zapisano: {KNOWN_OFFERS_FILE.name} ({len(known_offers)} ofert)")
+
+    # --- Statystyki per kategoria (na podstawie listing, nie detail) ---
     for cat in CATEGORIES:
-        cat_df = df[df["Category"] == cat]
-        if len(cat_df) > 0:
-            result["categories_ok"].append(cat)
-        else:
-            result["categories_empty"].append(cat)
+        result["categories_ok"].append(cat)
 
     # Sprawdź oferty bez Job_Title (oznaka złamania parsera)
-    empty_titles = df[df["Job_Title"].fillna("").str.strip() == ""]
-    if len(empty_titles) > 0:
-        result["errors"].append(
-            f"{len(empty_titles)} ofert bez Job_Title (możliwa zmiana struktury strony)"
-        )
+    if not df.empty and "Job_Title" in df.columns:
+        empty_titles = df[df["Job_Title"].fillna("").str.strip() == ""]
+        if len(empty_titles) > 0:
+            result["errors"].append(
+                f"{len(empty_titles)} ofert bez Job_Title (możliwa zmiana struktury strony)"
+            )
 
     result["success"] = len(result["errors"]) == 0 and result["total_offers"] > 0
 
@@ -813,34 +879,40 @@ def run(progress_callback=None) -> dict:
     print(f"\n{'='*70}")
     print("  PODSUMOWANIE")
     print(f"{'='*70}")
-    print(f"  Łącznie ofert:  {len(df)}")
-    print(f"  Zapisano do:    {output_path}\n")
+    print(f"  Ofert w listingu:    {result['total_offers']}")
+    print(f"  Nowych (detale):     {result['new_offers']}")
+    print(f"  Znanych (pominięto): {result['skipped_known']}")
 
-    for _, row in df.iterrows():
-        sr = str(row.get("Skills_Required", ""))[:45] or "(brak)"
-        sn = str(row.get("Skills_Nice_To_Have", ""))[:45] or "(brak)"
-        salary_uop = str(row.get("Salary_UoP", "Hidden"))
-        salary_b2b = str(row.get("Salary_B2B", "Hidden"))
-        print(f"  [{row['Category']:25s}] {str(row['Job_Title'])[:35]:35s}")
-        print(f"    UoP: {salary_uop:30s} B2B: {salary_b2b}")
-        print(f"    Req: {sr}")
-        print(f"    N2H: {sn}")
+    if not df.empty:
+        output_path = result.get("output_path", "?")
+        print(f"  Zapisano do:         {output_path}\n")
 
-    print(f"\n  Rozkład per kategoria:")
-    for cat in CATEGORIES:
-        cat_df = df[df["Category"] == cat]
-        if cat_df.empty:
-            continue
-        uop_count = (cat_df["Salary_UoP"] != "Hidden").sum()
-        b2b_count = (cat_df["Salary_B2B"] != "Hidden").sum()
-        print(f"    {cat:25s}  {len(cat_df)} ofert  (UoP: {uop_count}, B2B: {b2b_count})")
+        for _, row in df.iterrows():
+            sr = str(row.get("Skills_Required", ""))[:45] or "(brak)"
+            sn = str(row.get("Skills_Nice_To_Have", ""))[:45] or "(brak)"
+            salary_uop = str(row.get("Salary_UoP", "Hidden"))
+            salary_b2b = str(row.get("Salary_B2B", "Hidden"))
+            print(f"  [{row['Category']:25s}] {str(row['Job_Title'])[:35]:35s}")
+            print(f"    UoP: {salary_uop:30s} B2B: {salary_b2b}")
+            print(f"    Req: {sr}")
+            print(f"    N2H: {sn}")
+
+        print(f"\n  Rozkład per kategoria (nowe):")
+        for cat in CATEGORIES:
+            cat_df = df[df["Category"] == cat]
+            if cat_df.empty:
+                continue
+            uop_count = (cat_df["Salary_UoP"] != "Hidden").sum()
+            b2b_count = (cat_df["Salary_B2B"] != "Hidden").sum()
+            print(f"    {cat:25s}  {len(cat_df)} ofert  (UoP: {uop_count}, B2B: {b2b_count})")
 
     if result["sql_uploaded"] > 0:
-        print(f"\n  Azure SQL:  {result['sql_uploaded']}/{len(df)} ofert wysłanych do pracuj_offers")
+        print(f"\n  Azure SQL:  {result['sql_uploaded']} nowych ofert wysłanych do pracuj_offers")
 
     status = "[SUCCESS]" if result["success"] else "[WARNING]"
     print(f"\n{'='*70}")
-    print(f"{status} Scraping Pracuj.pl zakończony. Ofert: {result['total_offers']}, SQL: {result['sql_uploaded']}")
+    print(f"{status} Scraping Pracuj.pl zakończony. Listing: {result['total_offers']}, "
+          f"Nowe: {result['new_offers']}, SQL: {result['sql_uploaded']}")
     if result["errors"]:
         for err in result["errors"]:
             print(f"  [!] {err}")
@@ -849,7 +921,12 @@ def run(progress_callback=None) -> dict:
 
 
 def main():
-    run()
+    import argparse
+    parser = argparse.ArgumentParser(description="Pracuj.pl Premium Scraper")
+    parser.add_argument("--full", action="store_true",
+                        help="Tryb pełny — pobierz detale WSZYSTKICH ofert (bez cache)")
+    args = parser.parse_args()
+    run(full_mode=args.full)
 
 
 if __name__ == "__main__":
