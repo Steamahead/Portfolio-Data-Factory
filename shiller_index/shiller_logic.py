@@ -573,6 +573,8 @@ def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, pri
         logger.error("Gemini client not initialized")
         return None
 
+    backoff_schedule = [2, 10, 30]  # seconds — escalating backoff for transient errors
+
     for attempt in range(3):
         try:
             response = gemini_client.models.generate_content(
@@ -595,8 +597,9 @@ def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, pri
             }
 
         except Exception as e:
-            logger.warning(f"Attempt {attempt+1} failed: {e}")
-            time.sleep(2)
+            wait = backoff_schedule[attempt]
+            logger.warning(f"Attempt {attempt+1}/3 failed: {e}. Retrying in {wait}s...")
+            time.sleep(wait)
 
     return None
 
@@ -818,6 +821,7 @@ def fetch_news(ticker: str, trading_date) -> list[str]:
 
 # Orchestration retry configuration
 ORCHESTRATION_MAX_RETRIES = 2  # Retry failed tickers up to 2 more times
+GEMINI_OVERLOAD_DELAY = 45 * 60  # 45 minutes — delayed retry when Gemini returns 503 for all tickers
 
 
 def _process_single_ticker(ticker: str) -> tuple[dict | None, str | None]:
@@ -930,6 +934,31 @@ def run_shiller_analysis() -> list[dict]:
                         failed_tickers.append((ticker, new_error_type, analysis_result))
 
         still_failed = failed_tickers
+
+        # Delayed retry wave: if ALL tickers failed with LLM errors, wait and retry once more
+        llm_failures = [f for f in still_failed if f[1] == "llm_analysis_failed"]
+        if llm_failures and len(llm_failures) == len(still_failed):
+            logger.warning(
+                f"⏳ All {len(llm_failures)} tickers failed with LLM errors (likely Gemini overload). "
+                f"Waiting {GEMINI_OVERLOAD_DELAY // 60} minutes before delayed retry..."
+            )
+            time.sleep(GEMINI_OVERLOAD_DELAY)
+
+            logger.info(f"\n{'='*60}")
+            logger.info(f"DELAYED RETRY: Attempting {len(llm_failures)} ticker(s) after cooldown")
+            logger.info(f"{'='*60}")
+
+            still_failed = []
+            for ticker, error_type, _ in llm_failures:
+                logger.info(f"Delayed retry for {ticker}...")
+                analysis_result, new_error_type = _process_single_ticker(ticker)
+                if new_error_type is None:
+                    logger.info(f"✅ Delayed recovery successful for {ticker}")
+                    results.append(analysis_result)
+                else:
+                    still_failed.append((ticker, new_error_type, analysis_result))
+
+            failed_tickers = still_failed
 
         # Final summary
         if still_failed:
