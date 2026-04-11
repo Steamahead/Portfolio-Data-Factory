@@ -18,6 +18,7 @@ import yfinance as yf
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from google import genai
+from google.genai import errors as genai_errors
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -544,6 +545,9 @@ def calculate_weighted_averages(articles: list[dict]) -> dict:
 
 # --- 3. MAIN ANALYSIS FUNCTION ---
 
+# Stores last LLM error per ticker for diagnostics in alerts
+_last_llm_error: dict[str, dict] = {}
+
 def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, price_data: dict) -> dict | None:
     valid_headlines = [h for h in headlines if h != "N/A"]
     if not valid_headlines:
@@ -574,6 +578,7 @@ def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, pri
         return None
 
     backoff_schedule = [2, 10, 30]  # seconds — escalating backoff for transient errors
+    last_error = None
 
     for attempt in range(3):
         try:
@@ -596,11 +601,29 @@ def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, pri
                 "articles": llm_result["articles"]
             }
 
+        except genai_errors.ClientError as e:
+            # 4xx — permanent (auth, quota, bad request). No point retrying.
+            logger.error(f"Attempt {attempt+1}/3 PERMANENT error (HTTP {e.code}): {e}. Aborting retries.")
+            last_error = e
+            break
+
+        except genai_errors.ServerError as e:
+            # 5xx — transient (overload, timeout). Worth retrying.
+            wait = backoff_schedule[attempt]
+            logger.warning(f"Attempt {attempt+1}/3 transient error (HTTP {e.code}): {e}. Retrying in {wait}s...")
+            last_error = e
+            time.sleep(wait)
+
         except Exception as e:
             wait = backoff_schedule[attempt]
             logger.warning(f"Attempt {attempt+1}/3 failed: {e}. Retrying in {wait}s...")
+            last_error = e
             time.sleep(wait)
 
+    is_permanent = isinstance(last_error, genai_errors.ClientError)
+    error_detail = f"HTTP {last_error.code}: {last_error}" if isinstance(last_error, genai_errors.APIError) else str(last_error)
+    logger.error(f"All attempts failed for {ticker}. Permanent={is_permanent}. Last error: {error_detail}")
+    _last_llm_error[ticker] = {"permanent": is_permanent, "detail": error_detail}
     return None
 
 # --- 4. DATABASE FUNCTION ---
@@ -828,6 +851,7 @@ def _process_single_ticker(ticker: str) -> tuple[dict | None, str | None]:
     """
     Process a single ticker through the full pipeline.
     Returns (analysis_result, error_type) where error_type is None on success.
+    Error types prefixed with "PERMANENT:" won't be retried.
     """
     try:
         logger.info(f"{'='*60}")
@@ -854,8 +878,11 @@ def _process_single_ticker(ticker: str) -> tuple[dict | None, str | None]:
         analysis_result = analyze_hype_score(headlines, ticker, company_name, price_data)
 
         if not analysis_result:
-            logger.error(f"❌ Analysis failed for {ticker}")
-            return None, "llm_analysis_failed"
+            llm_err = _last_llm_error.get(ticker, {})
+            detail = llm_err.get("detail", "unknown")
+            prefix = "PERMANENT:" if llm_err.get("permanent") else ""
+            logger.error(f"❌ Analysis failed for {ticker}: {detail}")
+            return None, f"{prefix}llm_analysis_failed ({detail})"
 
         agg = analysis_result["aggregated_scores"]
         logger.info(f"✅ {ticker}: Sentiment={agg['final_sentiment']} ({agg['sentiment_confidence']}), Hype={agg['final_hype']} ({agg['hype_confidence']})")
@@ -915,6 +942,12 @@ def run_shiller_analysis() -> list[dict]:
             failed_tickers = []
 
             for ticker, error_type, cached_result in retry_queue:
+                # Skip permanent errors — no point retrying (e.g. auth, quota)
+                if error_type.startswith("PERMANENT:"):
+                    logger.warning(f"⛔ Skipping retry for {ticker} — permanent error: {error_type}")
+                    failed_tickers.append((ticker, error_type, cached_result))
+                    continue
+
                 # If we have cached analysis result and only DB failed, just retry DB save
                 if error_type == "database_save_failed" and cached_result is not None:
                     logger.info(f"Retrying database save for {ticker}...")
@@ -935,8 +968,8 @@ def run_shiller_analysis() -> list[dict]:
 
         still_failed = failed_tickers
 
-        # Delayed retry wave: if ALL tickers failed with LLM errors, wait and retry once more
-        llm_failures = [f for f in still_failed if f[1] == "llm_analysis_failed"]
+        # Delayed retry wave: if ALL tickers failed with LLM errors (transient only), wait and retry
+        llm_failures = [f for f in still_failed if "llm_analysis_failed" in f[1] and not f[1].startswith("PERMANENT:")]
         if llm_failures and len(llm_failures) == len(still_failed):
             logger.warning(
                 f"⏳ All {len(llm_failures)} tickers failed with LLM errors (likely Gemini overload). "
