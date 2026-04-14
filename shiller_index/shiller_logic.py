@@ -577,13 +577,13 @@ def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, pri
         logger.error("Gemini client not initialized")
         return None
 
-    backoff_schedule = [2, 10, 30]  # seconds — escalating backoff for transient errors
+    backoff_schedule = [5, 30, 90]  # seconds — escalating backoff for transient errors (Gemini overload needs longer gaps)
     last_error = None
 
     for attempt in range(3):
         try:
             response = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.1-flash-live-preview",
                 contents=prompt
             )
             text = response.text if hasattr(response, 'text') else str(response)
@@ -602,10 +602,17 @@ def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, pri
             }
 
         except genai_errors.ClientError as e:
-            # 4xx — permanent (auth, quota, bad request). No point retrying.
-            logger.error(f"Attempt {attempt+1}/3 PERMANENT error (HTTP {e.code}): {e}. Aborting retries.")
-            last_error = e
-            break
+            if e.code == 429:
+                # 429 Too Many Requests — rate limit hit, transient. Wait longer.
+                wait = backoff_schedule[attempt] * 2  # double the backoff for rate limits
+                logger.warning(f"Attempt {attempt+1}/3 RATE LIMITED (HTTP 429): {e}. Retrying in {wait}s...")
+                last_error = e
+                time.sleep(wait)
+            else:
+                # Other 4xx — permanent (auth, quota, bad request). No point retrying.
+                logger.error(f"Attempt {attempt+1}/3 PERMANENT error (HTTP {e.code}): {e}. Aborting retries.")
+                last_error = e
+                break
 
         except genai_errors.ServerError as e:
             # 5xx — transient (overload, timeout). Worth retrying.
@@ -620,7 +627,7 @@ def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, pri
             last_error = e
             time.sleep(wait)
 
-    is_permanent = isinstance(last_error, genai_errors.ClientError)
+    is_permanent = isinstance(last_error, genai_errors.ClientError) and getattr(last_error, 'code', 0) != 429
     error_detail = f"HTTP {last_error.code}: {last_error}" if isinstance(last_error, genai_errors.APIError) else str(last_error)
     logger.error(f"All attempts failed for {ticker}. Permanent={is_permanent}. Last error: {error_detail}")
     _last_llm_error[ticker] = {"permanent": is_permanent, "detail": error_detail}
@@ -914,8 +921,11 @@ def run_shiller_analysis() -> list[dict]:
     # Track failures with their analysis results (for DB-only retries)
     failed_tickers: list[tuple[str, str, dict | None]] = []  # (ticker, error_type, analysis_result)
 
-    # First pass: process all tickers
-    for ticker in TICKERS:
+    # First pass: process all tickers (with 15s gap to avoid Gemini RPM rate limits)
+    for i, ticker in enumerate(TICKERS):
+        if i > 0:
+            logger.info("⏸ Waiting 15s between tickers (rate limit protection)...")
+            time.sleep(15)
         analysis_result, error_type = _process_single_ticker(ticker)
         if error_type is None:
             results.append(analysis_result)
@@ -968,11 +978,11 @@ def run_shiller_analysis() -> list[dict]:
 
         still_failed = failed_tickers
 
-        # Delayed retry wave: if ALL tickers failed with LLM errors (transient only), wait and retry
+        # Delayed retry wave: if ANY tickers failed with transient LLM errors, wait and retry
         llm_failures = [f for f in still_failed if "llm_analysis_failed" in f[1] and not f[1].startswith("PERMANENT:")]
-        if llm_failures and len(llm_failures) == len(still_failed):
+        if llm_failures:
             logger.warning(
-                f"⏳ All {len(llm_failures)} tickers failed with LLM errors (likely Gemini overload). "
+                f"⏳ {len(llm_failures)} ticker(s) failed with transient LLM errors (likely Gemini overload). "
                 f"Waiting {GEMINI_OVERLOAD_DELAY // 60} minutes before delayed retry..."
             )
             time.sleep(GEMINI_OVERLOAD_DELAY)
@@ -981,7 +991,9 @@ def run_shiller_analysis() -> list[dict]:
             logger.info(f"DELAYED RETRY: Attempting {len(llm_failures)} ticker(s) after cooldown")
             logger.info(f"{'='*60}")
 
-            still_failed = []
+            # Keep non-LLM failures, retry only LLM ones
+            non_llm_failures = [f for f in still_failed if f not in llm_failures]
+            delayed_failed = []
             for ticker, error_type, _ in llm_failures:
                 logger.info(f"Delayed retry for {ticker}...")
                 analysis_result, new_error_type = _process_single_ticker(ticker)
@@ -989,8 +1001,9 @@ def run_shiller_analysis() -> list[dict]:
                     logger.info(f"✅ Delayed recovery successful for {ticker}")
                     results.append(analysis_result)
                 else:
-                    still_failed.append((ticker, new_error_type, analysis_result))
+                    delayed_failed.append((ticker, new_error_type, analysis_result))
 
+            still_failed = non_llm_failures + delayed_failed
             failed_tickers = still_failed
 
         # Final summary
