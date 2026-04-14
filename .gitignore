@@ -23,9 +23,13 @@ __pycache__/
 .agents/
 .claude/
 *.swp
+.pytest_cache/
+.python_packages/
 
 # --- RECON / SAMPLE DATA ---
 gov_spending_radar/recon_html/
+debug_data/
+logs/
 
 # --- AZURE FUNCTIONS ---
 bin/
@@ -37,3 +41,6 @@ appsettings.json
 !GovSpendingRun/function.json
 energy_prophet/backfill_safe.py
 energy_prophet/backfill_feb2026.py
+# Working files
+blog_articles.md
+*.tmp
