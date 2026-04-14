@@ -105,6 +105,8 @@ BROWSER_UA = (
 )
 
 CF_WAIT_SECONDS = 10  # czas na rozwiązanie Cloudflare w headed mode
+CF_RESTART_AFTER = 5  # restart browser po tylu consecutive failures
+CF_ABORT_AFTER = 15   # abort FAZA 2 po tylu consecutive failures (po 2 restartach)
 
 
 # --- Utility ---
@@ -455,16 +457,33 @@ def _launch_headed_browser(playwright):
     return browser, ctx, page
 
 
+def _restart_browser(playwright, browser, ctx):
+    """Zamyka stary browser i tworzy nowy (fresh Cloudflare fingerprint)."""
+    try:
+        ctx.close()
+    except Exception:
+        pass
+    try:
+        browser.close()
+    except Exception:
+        pass
+    time.sleep(5)
+    return _launch_headed_browser(playwright)
+
+
 def phase2_deep_dive(playwright, stubs: list[dict], progress_callback=None) -> list[dict]:
     """
     Otwiera każdą ofertę w headed browser (Cloudflare bypass).
     Wyciąga pełne dane z __NEXT_DATA__ detail page.
-    Auto-recovery: restartuje browser po crashu.
+
+    Circuit breaker: po CF_RESTART_AFTER consecutive failures restartuje browser.
+    Po CF_ABORT_AFTER consecutive failures przerywa FAZA 2 z częściowymi wynikami.
     """
     print(f"\n[FAZA 2] Deep Dive - {len(stubs)} ofert (headed browser)...\n")
 
     browser, ctx, page = _launch_headed_browser(playwright)
     all_rows: list[dict] = []
+    consecutive_fails = 0
 
     for idx, stub in enumerate(stubs, 1):
         url = stub["url"]
@@ -475,6 +494,7 @@ def phase2_deep_dive(playwright, stubs: list[dict], progress_callback=None) -> l
         if progress_callback:
             progress_callback(idx, len(stubs), "details")
 
+        page_ok = False
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
@@ -496,10 +516,18 @@ def phase2_deep_dive(playwright, stubs: list[dict], progress_callback=None) -> l
                     "Url": url,
                     "Scraped_At": datetime.now().isoformat(),
                 })
+                # "Ups..." = Cloudflare block — liczymy jako failure
+                if "ups" in (title or "").lower():
+                    consecutive_fails += 1
+                else:
+                    consecutive_fails = 0
+                    page_ok = True
                 continue
 
             row = parse_detail_page(nd, cat, url)
             all_rows.append(row)
+            consecutive_fails = 0
+            page_ok = True
 
             print(f"    Tytuł:     {row['Job_Title']}")
             print(f"    Firma:     {row['Company']}")
@@ -521,21 +549,28 @@ def phase2_deep_dive(playwright, stubs: list[dict], progress_callback=None) -> l
                 "Url": url,
                 "Scraped_At": datetime.now().isoformat(),
             })
+            consecutive_fails += 1
 
             # Auto-recovery: jeśli browser/page padł, restartuj
             if "closed" in err_msg.lower() or "crash" in err_msg.lower():
-                print("    [recovery] Restartuję przeglądarkę...")
-                try:
-                    ctx.close()
-                except Exception:
-                    pass
-                try:
-                    browser.close()
-                except Exception:
-                    pass
-                time.sleep(2)
-                browser, ctx, page = _launch_headed_browser(playwright)
+                print("    [recovery] Browser crash — restartuję...")
+                browser, ctx, page = _restart_browser(playwright, browser, ctx)
+                consecutive_fails = 0
                 print("    [recovery] Przeglądarka gotowa")
+
+        # --- Circuit breaker: Cloudflare blokuje sesję ---
+        if consecutive_fails > 0 and consecutive_fails % CF_RESTART_AFTER == 0:
+            print(f"\n    [circuit-breaker] {consecutive_fails} consecutive failures "
+                  f"— restartuję browser (nowa sesja)...")
+            browser, ctx, page = _restart_browser(playwright, browser, ctx)
+            print(f"    [circuit-breaker] Nowy browser gotowy\n")
+
+        if consecutive_fails >= CF_ABORT_AFTER:
+            remaining = len(stubs) - idx
+            print(f"\n    [circuit-breaker] ABORT: {consecutive_fails} consecutive failures, "
+                  f"pomijam {remaining} pozostałych ofert.")
+            print(f"    Zebrano {len(all_rows)} ofert (częściowe wyniki).\n")
+            break
 
         polite_delay(2.0, 4.0)
 
@@ -926,7 +961,37 @@ def main():
     parser.add_argument("--full", action="store_true",
                         help="Tryb pełny — pobierz detale WSZYSTKICH ofert (bez cache)")
     args = parser.parse_args()
-    run(full_mode=args.full)
+
+    try:
+        result = run(full_mode=args.full)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"\n[MONITOR] Scraper rzucił wyjątek:\n{tb}")
+        result = {
+            "success": False,
+            "total_offers": 0,
+            "categories_ok": [],
+            "categories_empty": [],
+            "errors": [f"Nieobsłużony wyjątek: {e}"],
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    # Zapis wyniku dla scraper_monitor (subprocess isolation)
+    result_file = os.environ.get("SCRAPER_RESULT_FILE")
+    if result_file:
+        try:
+            with open(result_file, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False)
+        except Exception as exc:
+            print(f"  [WARN] Nie udało się zapisać wyniku do {result_file}: {exc}")
+    else:
+        # Standalone mode — monitoring inline
+        try:
+            from pracuj_scraper.scraper_monitor import monitor_scraper
+            monitor_scraper("Pracuj.pl", result)
+        except ImportError:
+            print("  [INFO] scraper_monitor niedostepny - pomijam monitoring email")
 
 
 if __name__ == "__main__":

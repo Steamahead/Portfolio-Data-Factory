@@ -976,11 +976,21 @@ def main():
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    try:
-        from pracuj_scraper.scraper_monitor import monitor_scraper
-        monitor_scraper("NoFluffJobs", result)
-    except ImportError:
-        print("  [INFO] scraper_monitor niedostepny - pomijam monitoring email")
+    # Zapis wyniku dla scraper_monitor (subprocess isolation)
+    result_file = os.environ.get("SCRAPER_RESULT_FILE")
+    if result_file:
+        try:
+            with open(result_file, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False)
+        except Exception as exc:
+            print(f"  [WARN] Nie udało się zapisać wyniku do {result_file}: {exc}")
+    else:
+        # Standalone mode — monitoring inline
+        try:
+            from pracuj_scraper.scraper_monitor import monitor_scraper
+            monitor_scraper("NoFluffJobs", result)
+        except ImportError:
+            print("  [INFO] scraper_monitor niedostepny - pomijam monitoring email")
 
     # Print final status
     s = result.get("success", False)

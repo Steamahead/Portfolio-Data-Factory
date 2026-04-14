@@ -753,6 +753,7 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
     # ---- FAZA 1: Zbieranie slugow ----
     print("\n[FAZA 1] Zbieranie listy ofert z kazdej kategorii...\n")
     category_items: dict[str, list[dict]] = {}
+    listing_counts: dict[str, int] = {}
     seen_ids: set[str] = set()
 
     for cat in CATEGORIES:
@@ -762,6 +763,7 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
         unique = [it for it in items if it["offer_id"] not in seen_ids]
         seen_ids.update(it["offer_id"] for it in unique)
         category_items[cat] = unique
+        listing_counts[cat] = len(unique)
 
         print(f"  {cat.upper():12s}  pobrano {len(unique):>4d} ofert"
               f"  (total w kategorii: {total})")
@@ -780,6 +782,11 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
     # ---- UPDATE last_seen w SQL dla WSZYSTKICH aktywnych ofert ----
     all_listing_ids = [it["offer_id"] for items in category_items.values() for it in items]
     update_last_seen_sql(all_listing_ids)
+
+    # Zapamietaj wszystkie offer_id z listingu — do uzupelnienia cache po Phase 2.
+    # Dzieki temu oferty zagraniczne (non-PL) tez trafia do cache i nie beda
+    # ponownie pobierane w kolejnych runach.
+    all_listing_offer_ids = {it["offer_id"] for items in category_items.values() for it in items}
 
     # ---- Filtracja known_offers (tryb inkrementalny) ----
     known_offers = {}
@@ -854,9 +861,27 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
 
     # ---- FAZA 3: Zapis ----
     if not all_offers:
-        print("\n[FAIL] Nie udalo sie pobrac zadnych ofert.")
-        result["errors"].append("Pobrano 0 ofert po filtrze PL!")
-        return result
+        # Zapisz cache nawet gdy 0 PL — zapamietaj zagraniczne offer_id
+        for oid in all_listing_offer_ids:
+            known_offers.setdefault(oid, "")
+        save_known_offers(known_offers)
+        print(f"  Cache zapisano:    {KNOWN_OFFERS_FILE} ({len(known_offers)} ofert)")
+
+        if grand_total > 0:
+            # Listing mial oferty, ale zadna nowa nie przeszla filtru PL — to nie FAIL
+            print(f"\n[OK] Brak nowych ofert PL (odfiltrowano {grand_total_details} zagranicznych).")
+            result["success"] = True
+            result["new_offers"] = 0
+            for cat in CATEGORIES:
+                if listing_counts.get(cat, 0) > 0:
+                    result["categories_ok"].append(cat)
+                else:
+                    result["categories_empty"].append(cat)
+            return result
+        else:
+            print("\n[FAIL] Nie udalo sie pobrac zadnych ofert.")
+            result["errors"].append("Pobrano 0 ofert po filtrze PL!")
+            return result
 
     output = {
         "metadata": {
@@ -884,8 +909,12 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
         result["errors"].extend(sql_result["errors"])
 
     # ---- Zapis known_offers cache ----
+    # Zapisz PL oferty z publishedAt
     for offer in all_offers:
         known_offers[offer["offer_id"]] = offer.get("published_at", "")
+    # Zapisz tez zagraniczne offer_id (bez publishedAt) — unikamy ponownego fetchowania
+    for oid in all_listing_offer_ids:
+        known_offers.setdefault(oid, "")
     save_known_offers(known_offers)
     print(f"  Cache zapisano:    {KNOWN_OFFERS_FILE} ({len(known_offers)} ofert)")
 
@@ -916,7 +945,9 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
     # total_offers = listing count (ustawiony wczesniej), nie detale
     result["new_offers"] = len(all_offers)
     for cat in CATEGORIES:
-        if stats.get(cat, 0) > 0:
+        # Kategoria OK jesli miala oferty w listingu LUB pobrano nowe detale.
+        # W trybie inkrementalnym brak nowych != brak ofert w kategorii.
+        if listing_counts.get(cat, 0) > 0 or stats.get(cat, 0) > 0:
             result["categories_ok"].append(cat)
         else:
             result["categories_empty"].append(cat)
@@ -948,12 +979,21 @@ def main():
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    # Opcjonalny monitoring — nie blokuje jesli pracuj_scraper niedostepny
-    try:
-        from pracuj_scraper.scraper_monitor import monitor_scraper
-        monitor_scraper("JustJoin.it", result)
-    except ImportError:
-        print("  [INFO] scraper_monitor niedostepny - pomijam monitoring email")
+    # Zapis wyniku dla scraper_monitor (subprocess isolation)
+    result_file = os.environ.get("SCRAPER_RESULT_FILE")
+    if result_file:
+        try:
+            with open(result_file, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False)
+        except Exception as exc:
+            print(f"  [WARN] Nie udalo sie zapisac wyniku do {result_file}: {exc}")
+    else:
+        # Standalone mode — monitoring inline
+        try:
+            from pracuj_scraper.scraper_monitor import monitor_scraper
+            monitor_scraper("JustJoin.it", result)
+        except ImportError:
+            print("  [INFO] scraper_monitor niedostepny - pomijam monitoring email")
 
 
 if __name__ == "__main__":

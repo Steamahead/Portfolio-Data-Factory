@@ -41,6 +41,7 @@ import sys
 import json
 import smtplib
 import argparse
+import subprocess
 import tempfile
 import traceback
 from email.mime.text import MIMEText
@@ -498,81 +499,117 @@ def build_daily_report_html(results: dict, history: list[dict]) -> str:
     return html
 
 
-# --- Runner ---
+# --- Runner (subprocess isolation) ---
 
-def run_pracuj(dry_run: bool = False, progress_callback=None) -> dict:
-    """Uruchamia Pracuj.pl scraper i zwraca wynik."""
+# Konfiguracja scraperów: (nazwa, moduł/skrypt, timeout w sekundach)
+SCRAPER_CONFIGS = {
+    "NoFluffJobs": {
+        "cmd": [str(PROJECT_DIR / ".venv" / "Scripts" / "python.exe"), "-X", "utf8",
+                "-m", "nfj_scraper.nfj_data_scraper"],
+        "timeout": 1200,  # 20 min
+    },
+    "JustJoin.it": {
+        "cmd": [str(PROJECT_DIR / ".venv" / "Scripts" / "python.exe"), "-X", "utf8",
+                str(PROJECT_DIR / "just_join_scraper" / "just_join_scraper.py")],
+        "timeout": 1200,  # 20 min
+    },
+    "Pracuj.pl": {
+        "cmd": [str(PROJECT_DIR / ".venv" / "Scripts" / "python.exe"), "-X", "utf8",
+                "-m", "pracuj_scraper.pracuj_premium_scraper"],
+        "timeout": 9000,  # 150 min (Playwright, najcięższy)
+    },
+}
+
+
+def _run_scraper_subprocess(scraper_name: str) -> dict:
+    """
+    Uruchamia scraper jako osobny proces (fault isolation).
+
+    Każdy scraper działa we własnym python.exe — crash jednego NIE zabija pozostałych.
+    Wynik (result dict) jest przekazywany przez plik tymczasowy via SCRAPER_RESULT_FILE env var.
+    """
+    config = SCRAPER_CONFIGS[scraper_name]
+
     print("\n" + "=" * 70)
-    print("  MONITOR: Uruchamiam Pracuj.pl scraper...")
-    print("=" * 70)
+    print(f"  MONITOR: Uruchamiam {scraper_name} scraper (subprocess)...")
+    print("=" * 70, flush=True)
+
+    # Plik tymczasowy na wynik scrapera (result dict jako JSON)
+    fd, result_file = tempfile.mkstemp(suffix=".json", prefix=f"scraper_result_{scraper_name}_")
+    os.close(fd)
+
+    env = os.environ.copy()
+    env["SCRAPER_RESULT_FILE"] = result_file
+
+    fail_result = {
+        "success": False,
+        "total_offers": 0,
+        "categories_ok": [],
+        "categories_empty": [],
+        "errors": [],
+        "timestamp": datetime.now().isoformat(),
+    }
 
     try:
-        from pracuj_premium_scraper import run as pracuj_run
-        result = pracuj_run(progress_callback=progress_callback)
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"\n[MONITOR] Scraper rzucił wyjątek:\n{tb}")
-        result = {
-            "success": False,
-            "total_offers": 0,
-            "categories_ok": [],
-            "categories_empty": [],
-            "errors": [f"Nieobsłużony wyjątek: {e}"],
-            "output_path": None,
-            "timestamp": datetime.now().isoformat(),
-        }
+        proc = subprocess.run(
+            config["cmd"],
+            cwd=str(PROJECT_DIR),
+            env=env,
+            timeout=config["timeout"],
+            # stdout/stderr idą bezpośrednio do naszego stdout (= do pliku logu bat'a)
+        )
 
-    return result
+        if proc.returncode != 0:
+            fail_result["errors"].append(
+                f"Proces zakończył się kodem {proc.returncode}"
+            )
+
+    except subprocess.TimeoutExpired:
+        print(f"\n[MONITOR] TIMEOUT: {scraper_name} przekroczył {config['timeout']}s!", flush=True)
+        fail_result["errors"].append(
+            f"Timeout po {config['timeout']}s"
+        )
+
+    except Exception as e:
+        print(f"\n[MONITOR] Błąd uruchamiania {scraper_name}: {e}", flush=True)
+        fail_result["errors"].append(f"Błąd subprocess: {e}")
+
+    # Odczytaj wynik z pliku tymczasowego
+    result = None
+    try:
+        content = Path(result_file).read_text(encoding="utf-8").strip()
+        if content:
+            result = json.loads(content)
+    except (json.JSONDecodeError, FileNotFoundError, Exception) as e:
+        print(f"  [MONITOR] Nie udało się odczytać wyniku z {result_file}: {e}", flush=True)
+    finally:
+        try:
+            os.unlink(result_file)
+        except OSError:
+            pass
+
+    if result:
+        return result
+
+    # Brak pliku wynikowego — scraper się wysypał przed zapisem
+    if not fail_result["errors"]:
+        fail_result["errors"].append("Scraper nie zapisał wyniku (crash lub brak SCRAPER_RESULT_FILE)")
+    return fail_result
+
+
+def run_pracuj(dry_run: bool = False, progress_callback=None) -> dict:
+    """Uruchamia Pracuj.pl scraper jako subprocess."""
+    return _run_scraper_subprocess("Pracuj.pl")
 
 
 def run_nfj(dry_run: bool = False, progress_callback=None) -> dict:
-    """Uruchamia NoFluffJobs scraper i zwraca wynik."""
-    print("\n" + "=" * 70)
-    print("  MONITOR: Uruchamiam NoFluffJobs scraper...")
-    print("=" * 70)
-
-    try:
-        sys.path.insert(0, str(PROJECT_DIR))
-        from nfj_scraper.nfj_data_scraper import run as nfj_run
-        result = nfj_run(progress_callback=progress_callback)
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"\n[MONITOR] Scraper rzucił wyjątek:\n{tb}")
-        result = {
-            "success": False,
-            "total_offers": 0,
-            "categories_ok": [],
-            "categories_empty": [],
-            "errors": [f"Nieobsłużony wyjątek: {e}"],
-            "timestamp": datetime.now().isoformat(),
-        }
-
-    return result
+    """Uruchamia NoFluffJobs scraper jako subprocess."""
+    return _run_scraper_subprocess("NoFluffJobs")
 
 
 def run_justjoin(dry_run: bool = False, progress_callback=None) -> dict:
-    """Uruchamia JustJoin.it scraper i zwraca wynik."""
-    print("\n" + "=" * 70)
-    print("  MONITOR: Uruchamiam JustJoin.it scraper...")
-    print("=" * 70)
-
-    try:
-        sys.path.insert(0, str(PROJECT_DIR))
-        from just_join_scraper.just_join_scraper import run as justjoin_run
-        result = justjoin_run(progress_callback=progress_callback)
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"\n[MONITOR] Scraper rzucił wyjątek:\n{tb}")
-        result = {
-            "success": False,
-            "total_offers": 0,
-            "categories_ok": [],
-            "categories_empty": [],
-            "errors": [f"Nieobsłużony wyjątek: {e}"],
-            "timestamp": datetime.now().isoformat(),
-        }
-
-    return result
+    """Uruchamia JustJoin.it scraper jako subprocess."""
+    return _run_scraper_subprocess("JustJoin.it")
 
 
 def monitor_scraper(scraper_name: str, result: dict, dry_run: bool = False):
@@ -756,40 +793,34 @@ def main():
     tracker = ProgressTracker()
     tracker.start_run(scrapers_planned)
 
-    # --- Uruchom scrapery ---
+    # --- Uruchom scrapery (subprocess isolation) ---
+    # Każdy scraper działa jako osobny python.exe — crash jednego NIE zabija pozostałych.
     # Kolejność: NFJ (szybkie API) → JustJoin (REST API) → Pracuj (Playwright, najcięższy)
     results = {}
-    fatal_error = None
 
-    try:
-        # NoFluffJobs
-        if run_all or args.nfj_only:
-            tracker.start_scraper("NoFluffJobs")
-            result = run_nfj(dry_run=args.dry_run, progress_callback=tracker.update)
-            results["NoFluffJobs"] = result
-            tracker.finish_scraper("NoFluffJobs", result)
-            monitor_scraper("NoFluffJobs", result, dry_run=args.dry_run)
+    # NoFluffJobs
+    if run_all or args.nfj_only:
+        tracker.start_scraper("NoFluffJobs")
+        result = run_nfj(dry_run=args.dry_run)
+        results["NoFluffJobs"] = result
+        tracker.finish_scraper("NoFluffJobs", result)
+        monitor_scraper("NoFluffJobs", result, dry_run=args.dry_run)
 
-        # JustJoin.it
-        if run_all or args.justjoin_only:
-            tracker.start_scraper("JustJoin.it")
-            result = run_justjoin(dry_run=args.dry_run, progress_callback=tracker.update)
-            results["JustJoin.it"] = result
-            tracker.finish_scraper("JustJoin.it", result)
-            monitor_scraper("JustJoin.it", result, dry_run=args.dry_run)
+    # JustJoin.it
+    if run_all or args.justjoin_only:
+        tracker.start_scraper("JustJoin.it")
+        result = run_justjoin(dry_run=args.dry_run)
+        results["JustJoin.it"] = result
+        tracker.finish_scraper("JustJoin.it", result)
+        monitor_scraper("JustJoin.it", result, dry_run=args.dry_run)
 
-        # Pracuj.pl (Playwright - uruchamiany jako ostatni, największe ryzyko RAM)
-        if run_all or args.pracuj_only:
-            tracker.start_scraper("Pracuj.pl")
-            result = run_pracuj(dry_run=args.dry_run, progress_callback=tracker.update)
-            results["Pracuj.pl"] = result
-            tracker.finish_scraper("Pracuj.pl", result)
-            monitor_scraper("Pracuj.pl", result, dry_run=args.dry_run)
-
-    except Exception as e:
-        fatal_error = f"{type(e).__name__}: {e}"
-        print(f"\n  [MONITOR] FATAL ERROR: {fatal_error}")
-        traceback.print_exc()
+    # Pracuj.pl (Playwright — uruchamiany jako ostatni, największe ryzyko RAM)
+    if run_all or args.pracuj_only:
+        tracker.start_scraper("Pracuj.pl")
+        result = run_pracuj(dry_run=args.dry_run)
+        results["Pracuj.pl"] = result
+        tracker.finish_scraper("Pracuj.pl", result)
+        monitor_scraper("Pracuj.pl", result, dry_run=args.dry_run)
 
     # --- Podsumowanie ---
     elapsed = datetime.now() - start_time
@@ -804,9 +835,6 @@ def main():
         if not r.get("success"):
             all_ok = False
         print(f"  {name:20s} [{status}] {r.get('total_offers', 0)} ofert")
-
-    if fatal_error:
-        all_ok = False
 
     # Sprawdź czy wszystkie planowane scrapery się uruchomiły
     missing_scrapers = [s for s in scrapers_planned if s not in results]
@@ -832,19 +860,13 @@ def main():
     else:
         print("  Wykryto problemy - sprawdź alerty powyżej.")
 
-    # --- Email FINISH (wysyłany ZAWSZE - nawet po crash) ---
-    if not args.dry_run and (results or fatal_error):
+    # --- Email FINISH (wysyłany ZAWSZE) ---
+    if not args.dry_run and results:
         email_config = get_email_config()
         if email_config:
             status_label = "SUCCESS" if all_ok else "FAILURE"
             subject = f"[{status_label}] Daily Report {datetime.now().strftime('%Y-%m-%d')} ({elapsed_str}) — Portfolio Data Factory"
-            if fatal_error:
-                # Dodaj info o fatal error do raportu
-                crash_note = f'<p style="color:#dc3545;font-weight:bold;">FATAL: {fatal_error}</p>'
-                body = build_daily_report_html(results, history_for_check)
-                body = body.replace("</h2>", f"</h2>{crash_note}", 1)
-            else:
-                body = build_daily_report_html(results, history_for_check)
+            body = build_daily_report_html(results, history_for_check)
             send_email(subject, body, email_config)
         else:
             print("\n  [MONITOR] Brak konfiguracji email - nie wysłano raportu dziennego.")
