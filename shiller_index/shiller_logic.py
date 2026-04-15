@@ -249,7 +249,7 @@ TICKERS = ["NVDA", "WMT", "TSLA"]
 
 TICKER_NEWS_CONFIG = {
     "NVDA": {"query": "Nvidia AND (stock OR shares OR AI OR chips OR earnings)", "company_name": "NVIDIA Corporation"},
-    "WMT": {"query": "Walmart AND (stock OR shares OR earnings OR retail)", "company_name": "Walmart Inc."},
+    "WMT": {"query": "\"Walmart\" AND (stock OR shares OR earnings OR \"Sam's Club\" OR revenue)", "company_name": "Walmart Inc."},
     "TSLA": {"query": "Tesla AND (stock OR shares OR Musk OR EV OR earnings)", "company_name": "Tesla Inc."},
 }
 
