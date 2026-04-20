@@ -26,6 +26,9 @@ import traceback
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from csv_staging_utils import is_csv_only
 
 # Windows UTF-8 fix
 if sys.platform == "win32":
@@ -459,10 +462,16 @@ Przyklady:
 
     # Special modes (run and exit)
     if args.cleanup:
+        if is_csv_only():
+            print("  [CSV-ONLY] --cleanup requires DB access, skipping")
+            sys.exit(0)
         _run_cleanup()
         sys.exit(0)
 
     if args.reclassify:
+        if is_csv_only():
+            print("  [CSV-ONLY] --reclassify requires DB access, skipping")
+            sys.exit(0)
         _run_reclassify()
         sys.exit(0)
 

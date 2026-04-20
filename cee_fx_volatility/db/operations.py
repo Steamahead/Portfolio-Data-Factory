@@ -26,6 +26,10 @@ from .schema import (
     NEWS_SQL_COLUMNS,
 )
 
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from csv_staging_utils import is_csv_only, save_to_staging
+
 # ── .env loading (same pattern as other scrapers) ──────────────────
 
 SCRIPT_DIR = Path(__file__).parent
@@ -109,6 +113,9 @@ def upload_fx_rates(records: list[dict]) -> dict:
     Returns:
         {"uploaded": int, "errors": list[str]}
     """
+    if is_csv_only():
+        save_to_staging(records, "cee_fx", "cee_fx_rates")
+        return {"uploaded": 0, "errors": []}
     result = {"uploaded": 0, "errors": []}
 
     if not records:
@@ -168,6 +175,9 @@ def upload_news(records: list[dict]) -> dict:
     Returns:
         {"uploaded": int, "errors": list[str]}
     """
+    if is_csv_only():
+        save_to_staging(records, "cee_fx", "cee_news_headlines")
+        return {"uploaded": 0, "errors": []}
     result = {"uploaded": 0, "errors": []}
 
     if not records:
