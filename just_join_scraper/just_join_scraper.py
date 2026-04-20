@@ -34,6 +34,9 @@ _SCRAPER_DIR_PATH = Path(__file__).parent
 _PROJECT_DIR = _SCRAPER_DIR_PATH.parent
 _ENV_FILE = _PROJECT_DIR / ".env"
 
+sys.path.insert(0, str(_PROJECT_DIR))
+from csv_staging_utils import is_csv_only, save_to_staging
+
 
 def _load_env():
     """Laduje zmienne z .env jesli plik istnieje. Niezalezne od pracuj_scraper."""
@@ -606,6 +609,9 @@ def upload_to_azure_sql(offers: list[dict]) -> dict:
 
     Zwraca dict: {"uploaded": int, "errors": list[str]}
     """
+    if is_csv_only():
+        save_to_staging(offers, "justjoin", "justjoin_offers")
+        return {"uploaded": 0, "errors": []}
     import pyodbc
 
     result = {"uploaded": 0, "errors": []}
@@ -674,6 +680,8 @@ def update_last_seen_sql(offer_ids: list[str]):
     Aktualizuje created_at (last_seen) dla wszystkich aktywnych ofert w SQL.
     Wywolywane po Fazie 1 — obejmuje WSZYSTKIE oferty z listingu, nie tylko nowe.
     """
+    if is_csv_only():
+        return
     import pyodbc
 
     conn_str = os.environ.get("SqlConnectionString")

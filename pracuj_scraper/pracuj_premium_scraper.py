@@ -47,6 +47,9 @@ SCRAPER_DIR = Path(__file__).parent
 PROJECT_DIR = SCRAPER_DIR.parent
 ENV_FILE = PROJECT_DIR / ".env"
 
+sys.path.insert(0, str(PROJECT_DIR))
+from csv_staging_utils import is_csv_only, save_to_staging
+
 
 def _load_env():
     """Ładuje zmienne z .env jeśli plik istnieje."""
@@ -104,7 +107,7 @@ BROWSER_UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-CF_WAIT_SECONDS = 10  # czas na rozwiązanie Cloudflare w headed mode
+CF_WAIT_SECONDS = 7   # czas na rozwiązanie Cloudflare w headed mode (było 10)
 CF_RESTART_AFTER = 5  # restart browser po tylu consecutive failures
 CF_ABORT_AFTER = 15   # abort FAZA 2 po tylu consecutive failures (po 2 restartach)
 
@@ -668,6 +671,9 @@ def upload_to_azure_sql(df: pd.DataFrame) -> dict:
 
     Zwraca dict: {"uploaded": int, "errors": list[str]}
     """
+    if is_csv_only():
+        save_to_staging(df, "pracuj", "pracuj_offers")
+        return {"uploaded": 0, "errors": []}
     result = {"uploaded": 0, "errors": []}
 
     conn_str = os.environ.get("SqlConnectionString")

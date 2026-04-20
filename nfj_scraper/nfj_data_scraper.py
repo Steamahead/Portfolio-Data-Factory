@@ -29,6 +29,9 @@ SCRAPER_DIR = Path(__file__).parent
 PROJECT_DIR = SCRAPER_DIR.parent
 ENV_FILE = PROJECT_DIR / ".env"
 
+sys.path.insert(0, str(PROJECT_DIR))
+from csv_staging_utils import is_csv_only, save_to_staging
+
 
 def _load_env():
     """Load variables from .env if file exists."""
@@ -630,6 +633,9 @@ def upload_to_azure_sql(df: pd.DataFrame) -> dict:
     Uses MERGE (upsert) by url key — safe for repeated runs.
     Returns dict: {"uploaded": int, "errors": list[str]}
     """
+    if is_csv_only():
+        save_to_staging(df, "nfj", "nfj_offers")
+        return {"uploaded": 0, "errors": []}
     result = {"uploaded": 0, "errors": []}
 
     conn_str = os.environ.get("SqlConnectionString")
