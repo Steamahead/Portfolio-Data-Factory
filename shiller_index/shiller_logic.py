@@ -21,6 +21,9 @@ from google import genai
 from google.genai import errors as genai_errors
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).parent.parent))
+from csv_staging_utils import is_csv_only, save_to_staging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -712,10 +715,69 @@ def _execute_database_save(final_data: dict, conn_str: str) -> bool:
                 pass
 
 
+def _save_shiller_to_csv(final_data: dict) -> None:
+    """Save Shiller analysis to CSV staging (two files: scores + articles)."""
+    meta = final_data["metadata"]
+    scores = final_data["aggregated_scores"]
+
+    # DailyScores row
+    scores_row = {
+        "date": meta["analysis_date"],
+        "ticker": meta["ticker"],
+        "price": meta["price"],
+        "ma_30": meta["ma_30"],
+        "gap_pct": meta["gap_pct"],
+        "final_sentiment": scores["final_sentiment"],
+        "final_hype": scores["final_hype"],
+        "sentiment_confidence": scores["sentiment_confidence"],
+        "hype_confidence": scores["hype_confidence"],
+        "articles_received": meta["articles_received"],
+        "articles_used_sentiment": scores["articles_used_sentiment"],
+        "articles_used_hype": scores["articles_used_hype"],
+    }
+    save_to_staging([scores_row], "shiller", "shiller_daily_scores")
+
+    # Articles rows
+    articles_rows = []
+    for art in final_data.get("articles", []):
+        qual = calculate_quality_scores(art)
+        qm = art.get("quality_metrics") or {}
+        sc = art.get("scores") or {}
+        filt = art.get("filter") or {}
+        articles_rows.append({
+            "date": meta["analysis_date"],
+            "ticker": meta["ticker"],
+            "article_num": art.get("article_num"),
+            "headline_preview": (art.get("headline_preview") or "")[:250],
+            "is_about_company": filt.get("is_about_company"),
+            "sentiment_usable": filt.get("sentiment_usable"),
+            "hype_usable": filt.get("hype_usable"),
+            "excluded": 1 if filt.get("excluded") else 0,
+            "exclusion_reason": filt.get("exclusion_reason"),
+            "centrality": qm.get("centrality"),
+            "credibility_sentiment": qm.get("credibility_sentiment"),
+            "credibility_hype": qm.get("credibility_hype"),
+            "recency": qm.get("recency"),
+            "materiality": qm.get("materiality"),
+            "speculation_signal": qm.get("speculation_signal"),
+            "quality_sentiment": qual["quality_sentiment"],
+            "quality_hype": qual["quality_hype"],
+            "sentiment_raw": sc.get("sentiment_raw"),
+            "hype_raw": sc.get("hype_raw"),
+            "reasoning": (art.get("reasoning") or "")[:2000],
+        })
+    if articles_rows:
+        save_to_staging(articles_rows, "shiller", "shiller_articles")
+
+
 def save_to_sql_database(final_data: dict) -> bool:
     """Save analysis results to SQL database with retry logic. Returns True on success, False on failure."""
     if not final_data:
         return False
+
+    if is_csv_only():
+        _save_shiller_to_csv(final_data)
+        return True
 
     conn_str = os.environ.get("SqlConnectionString")
     if not conn_str:
