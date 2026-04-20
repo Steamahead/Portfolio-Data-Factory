@@ -46,6 +46,8 @@ from .config.classification_rules import (
     CPV_NON_IT_HARD,
     CPV_SECTOR_MAP,
 )
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from csv_staging_utils import is_csv_only
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
 
@@ -384,6 +386,10 @@ def run(
 
     try:
         if mode == "classify":
+            if is_csv_only():
+                print("  [CSV-ONLY] --classify requires DB access, skipping")
+                result["success"] = True
+                return result
             classify_result = _run_classify(config, llm_only=llm_only)
             try:
                 _send_finish_email(classify_result)

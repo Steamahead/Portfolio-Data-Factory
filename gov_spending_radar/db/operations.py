@@ -29,6 +29,9 @@ from .schema import (
     CONTRACTORS_SQL_COLUMNS,
     CLASSIFICATIONS_SQL_COLUMNS,
 )
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from csv_staging_utils import is_csv_only, save_to_staging
 
 # ── .env loading (same pattern as other pipelines) ──────────────
 
@@ -105,6 +108,9 @@ def upload_notices(records: list[dict]) -> dict:
     Returns:
         {"uploaded": int, "errors": list[str]}
     """
+    if is_csv_only():
+        save_to_staging(records, "gov_spending", "gov_notices")
+        return {"uploaded": 0, "errors": []}
     result = {"uploaded": 0, "errors": []}
 
     if not records:
@@ -164,6 +170,9 @@ def upload_contractors(records: list[dict]) -> dict:
     Returns:
         {"uploaded": int, "errors": list[str]}
     """
+    if is_csv_only():
+        save_to_staging(records, "gov_spending", "gov_contractors")
+        return {"uploaded": 0, "errors": []}
     result = {"uploaded": 0, "errors": []}
 
     if not records:
@@ -222,6 +231,9 @@ def upload_classifications(records: list[dict]) -> dict:
     Returns:
         {"uploaded": int, "errors": list[str]}
     """
+    if is_csv_only():
+        save_to_staging(records, "gov_spending", "gov_classifications")
+        return {"uploaded": 0, "errors": []}
     result = {"uploaded": 0, "errors": []}
 
     if not records:
