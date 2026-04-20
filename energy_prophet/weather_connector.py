@@ -4,6 +4,11 @@ import pyodbc
 import logging
 import time
 import datetime
+import os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from csv_staging_utils import is_csv_only, save_to_staging
 
 
 class WeatherConnector:
@@ -158,6 +163,10 @@ class WeatherConnector:
 
     def _save_to_sql(self, df):
         if df.empty:
+            return
+
+        if is_csv_only():
+            save_to_staging(df, "energy", "weather_data")
             return
 
         create_table_sql = """

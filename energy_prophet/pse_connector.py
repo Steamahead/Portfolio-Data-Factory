@@ -10,6 +10,10 @@ import pandas as pd
 import pyodbc
 import datetime
 from typing import Dict, Optional
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from csv_staging_utils import is_csv_only, save_to_staging
 
 PSE_API_BASE = "https://api.raporty.pse.pl/api"
 
@@ -145,7 +149,7 @@ class PSEConnector:
         logging.info(f"{'='*60}")
 
         conn_str = os.environ.get("SqlConnectionString")
-        if not conn_str:
+        if not conn_str and not is_csv_only():
             logging.error("❌ Missing SqlConnectionString")
             return
 
@@ -168,6 +172,13 @@ class PSEConnector:
                     raw[ep] = df
 
             if not raw:
+                continue
+
+            # CSV-Only mode: save raw DataFrames to staging instead of SQL
+            if is_csv_only():
+                for ep, df in raw.items():
+                    table = ENDPOINT_CONFIG[ep]["target_table"]
+                    save_to_staging(df, "energy", table)
                 continue
 
             # Upload do SQL (z retry na cały blok connect+execute+commit)
