@@ -28,6 +28,15 @@ func start
 
 **Zawsze** `-X utf8` na Windows.
 
+## CSV-Only Mode
+
+When Azure SQL is unavailable, set `CSV_ONLY=1` in `.env`. All pipelines save to `csv_staging/` instead of DB. DB-read features (--classify, --reclassify, --cleanup) are auto-skipped.
+
+To restore:
+1. Remove `CSV_ONLY=1` from `.env`
+2. Run `python -X utf8 csv_to_db.py` to import staged data
+3. Optionally `python -X utf8 csv_to_db.py --dry-run` to preview first
+
 ## Zasady pracy
 
 - Czytaj `docs/STATUS.md` po każdym `/clear` — tam jest aktualny stan i następny krok
