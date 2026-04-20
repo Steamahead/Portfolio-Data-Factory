@@ -516,7 +516,7 @@ SCRAPER_CONFIGS = {
     "Pracuj.pl": {
         "cmd": [str(PROJECT_DIR / ".venv" / "Scripts" / "python.exe"), "-X", "utf8",
                 "-m", "pracuj_scraper.pracuj_premium_scraper"],
-        "timeout": 9000,  # 150 min (Playwright, najcięższy)
+        "timeout": 14400,  # 240 min (Playwright, najcięższy — CF_WAIT=7s, dużo detali)
     },
 }
 
