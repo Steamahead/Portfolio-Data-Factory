@@ -85,8 +85,24 @@ def _import_scraper(csv_path: Path, pipeline: str) -> int:
             from nfj_scraper.nfj_data_scraper import upload_to_azure_sql
             result = upload_to_azure_sql(df)
         elif pipeline == "justjoin":
+            import ast as _ast
+            import math as _math
             from just_join_scraper.just_join_scraper import upload_to_azure_sql
-            result = upload_to_azure_sql(df.to_dict("records"))
+            records = df.to_dict("records")
+            # CSV stores nested dicts/lists as Python repr strings — parse back
+            list_keys = ("salaries", "locations", "required_skills", "nice_to_have_skills",
+                         "skills", "multilocation")
+            for rec in records:
+                for key in list_keys:
+                    val = rec.get(key)
+                    if isinstance(val, float) and _math.isnan(val):
+                        rec[key] = []
+                    elif isinstance(val, str):
+                        try:
+                            rec[key] = _ast.literal_eval(val)
+                        except (ValueError, SyntaxError):
+                            rec[key] = []
+            result = upload_to_azure_sql(records)
         elif pipeline == "pracuj":
             from pracuj_scraper.pracuj_premium_scraper import upload_to_azure_sql
             result = upload_to_azure_sql(df)
@@ -225,6 +241,10 @@ def _import_energy(csv_path: Path, table: str) -> int:
 
         if table == "weather_data":
             from energy_prophet.weather_connector import WeatherConnector
+            # CSV stores datetime as string — convert back for SQL params
+            for col in ("dtime",):
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col])
             wc = WeatherConnector(conn_str)
             wc._save_to_sql(df)
             return len(df)
@@ -242,12 +262,22 @@ def _import_energy(csv_path: Path, table: str) -> int:
             }
 
             if table == "generation_mix":
-                connector._upsert_generation_mix(cursor, actuals=df, load_fcst=None, oze_fcst=None)
+                # CSV may contain actuals (has dtime) or oze_fcst (has plan_dtime)
+                if "dtime" in df.columns:
+                    connector._upsert_generation_mix(cursor, actuals=df, load_fcst=None, oze_fcst=None)
+                elif "plan_dtime" in df.columns:
+                    connector._upsert_generation_mix(cursor, actuals=None, load_fcst=None, oze_fcst=df)
+                else:
+                    connector._upsert_generation_mix(cursor, actuals=None, load_fcst=df, oze_fcst=None)
                 conn.commit()
                 return len(df)
 
             if table == "power_balance":
-                connector._upsert_power_balance(cursor, reserves=df, daily_plan=None)
+                # CSV may contain reserves (has peak_type) or daily_plan (has gen_fv)
+                if "peak_type" in df.columns or "rez_sr" in df.columns:
+                    connector._upsert_power_balance(cursor, reserves=df, daily_plan=None)
+                else:
+                    connector._upsert_power_balance(cursor, reserves=None, daily_plan=df)
                 conn.commit()
                 return len(df)
 
