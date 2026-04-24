@@ -2,18 +2,30 @@
 
 > Aktualizuj ten plik po każdej sesji. Po `/clear` — czytaj ten plik pierwszy.
 
-## Aktualny stan (2026-04-21)
+## Aktualny stan (2026-04-24)
 
-**CSV-Only mode ZAKOŃCZONY** — Azure SQL przywrócony, dane zaimportowane, pipeline'y wróciły pod Azure Functions.
+**CSV-Only mode ZAKOŃCZONY** — Azure SQL przywrócony, dane zaimportowane. Architektura docelowa:
+- **Azure Functions Timer** → Shiller / Energy / CEE FX / Gov Spending (4 triggery w `*DailyRun/` folderach)
+- **Lokalny Windows Task Scheduler** → Job Scrapers (Azure Functions ma limit 10min; Pracuj potrzebuje do 240min)
 
 ### Co się wydarzyło (2026-04-20 → 2026-04-21):
 1. Azure subscription read-only (niezapłacona FV) → włączono `CSV_ONLY=1`
-2. Stworzono lokalny runner (`run_etl_local.py`) + Task Scheduler (CEE co 1h, ETL Daily 08:00)
+2. Stworzono lokalny runner (`run_etl_local.py`) + Task Scheduler (CEE co 1h, ETL Daily 08:00) — **tylko dla CSV-Only**
 3. Zebrano dane przez ~24h: Energy, Gov Spending, CEE FX (24 hourly runs), Job Scrapers
 4. Azure odblokowany → dodano IP do firewall (dynamiczne IP: 185.203.173.180, potem 91.94.8.24)
 5. `csv_to_db.py` zaimportował 82 pliki do Azure SQL (naprawiono 3 bugi: JustJoin ast.literal_eval, weather datetime, energy schema routing)
-6. Usunięto lokalną automatyzację (Task Scheduler, bat files, runner), przywrócono Azure Functions
+6. Usunięto **CSV-Only** automatyzację (`run_etl_local.py`, `run_cee_fx_hourly.bat`, `run_etl_daily.bat`, `setup_task_scheduler.ps1`) — CEE/Energy/Gov/Shiller wróciły pod Azure Functions
 7. `CSV_ONLY=1` usunięte z `.env`
+
+### Uwaga (2026-04-24):
+Task `Portfolio Data Factory - Daily Scrapers` (lokalny Task Scheduler dla scraperów) **NIE jest częścią CSV-Only** — to stała produkcyjna orkiestracja. Commit `1f641cb` go nie dotykał. Jeśli przypadkowo wyrejestrowany, odtworzyć komendą:
+```powershell
+# Admin PowerShell:
+Register-ScheduledTask -TaskName "Portfolio Data Factory - Daily Scrapers" `
+  -Xml (Get-Content "C:\Users\sadza\PycharmProjects\portfolio-data-factory\scheduler_task.xml" | Out-String) `
+  -User "Full STEAM Ahead"
+```
+Lub: `& .\setup_scheduler.ps1` jako admin.
 
 ### Firewall Azure SQL
 IP jest dynamiczne — przy zmianie ISP trzeba dodać nowe IP w Azure Portal → SQL Server → Networking.
@@ -56,8 +68,9 @@ Stabilny. CSV-Only guard dodany.
 | JustJoin.it | ✅ OK | `349f441` |
 | Pracuj.pl | ✅ OK | `d7b08cf` — timeout 240min |
 
-Orchestracja: `scraper_monitor.py` → `run_daily_scrapers.bat` → Task Scheduler 20:00.
-Pracuj timeout zwiększony do 240min (CF_WAIT=7s).
+Orchestracja: `scraper_monitor.py` → `run_daily_scrapers.bat` → Windows Task Scheduler (`scheduler_task.xml`).
+Triggery: codziennie 19:00 (lokalny czas) + LogonTrigger+3min (catch-up po przerwie).
+Pracuj timeout zwiększony do 240min (CF_WAIT=7s). **Nie przenosić na Azure Functions** — limit 10min.
 
 ---
 
