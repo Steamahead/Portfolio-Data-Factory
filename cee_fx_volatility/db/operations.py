@@ -250,6 +250,28 @@ def fetch_unclassified_news() -> list[dict]:
         return []
 
 
+def fetch_classified_news_urls() -> set[str]:
+    """
+    Fetch URLs of news already classified (category IS NOT NULL).
+    Used by news pipeline to skip Gemini calls for previously seen articles.
+
+    Returns:
+        Set of URL strings. Empty set on error (caller falls back to classifying all).
+    """
+    if is_csv_only():
+        return set()
+    try:
+        with _connect_with_retry() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT url FROM cee_news_headlines WHERE category IS NOT NULL"
+            )
+            return {row[0] for row in cursor.fetchall()}
+    except Exception as e:
+        print(f"  [SQL] Błąd pobierania URL-i sklasyfikowanych newsów: {e}")
+        return set()
+
+
 def update_news_classification(url: str, category: str, sentiment: float,
                                 is_surprising: int, raw_ai_response: str) -> bool:
     """Update AI classification fields for a single news record by URL."""

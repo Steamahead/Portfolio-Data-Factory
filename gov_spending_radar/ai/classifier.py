@@ -150,7 +150,7 @@ def classify_notice(
         except Exception as e:
             print(f"  [AI] Próba {attempt + 1}/3 nieudana dla '{title[:40]}...': {e}")
             if attempt < 2:
-                time.sleep(2)
+                time.sleep(30)
 
     return None
 

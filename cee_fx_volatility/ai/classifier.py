@@ -149,7 +149,7 @@ def classify_headline(title: str, description: str | None = None) -> dict | None
         except Exception as e:
             print(f"  [AI] Próba {attempt + 1}/3 nieudana dla '{title[:40]}...': {e}")
             if attempt < 2:
-                time.sleep(2)
+                time.sleep(30)
 
     return None
 
@@ -190,8 +190,9 @@ def classify_batch(news_records: list[dict]) -> list[dict]:
             failed += 1
             print("→ BRAK KLASYFIKACJI")
 
-        # Rate limiting — be polite to the API
-        time.sleep(0.5)
+        # Rate limiting — Free tier gemini-3.1-flash-lite-preview has 15 RPM
+        # 5s = 12 RPM with safety margin
+        time.sleep(5)
 
     print(f"\n  [AI] Klasyfikacja: {classified}/{len(news_records)} OK, {failed} bez klasyfikacji")
     return news_records

@@ -316,7 +316,7 @@ def _run_news_pipeline() -> dict:
     """Run news collection + AI classification pipeline."""
     from .collectors.news_collector import fetch_news
     from .ai.classifier import classify_batch
-    from .db.operations import upload_news
+    from .db.operations import upload_news, fetch_classified_news_urls
 
     print(f"\n{'─' * 55}")
     print("  STRUMIEN NEWS — Polskie naglowki finansowe")
@@ -326,8 +326,22 @@ def _run_news_pipeline() -> dict:
     if not records:
         return {"news_fetched": 0, "news_classified": 0, "news_uploaded": 0, "news_errors": ["Brak newsow"]}
 
-    # Classify headlines with Gemini (graceful — failure = None fields)
-    records = classify_batch(records)
+    # Dedup: skip Gemini for URLs already classified in DB.
+    # Hourly RSS feeds repeat ~90% of items run-over-run — without dedup
+    # we'd burn 24x the quota classifying the same articles.
+    already_classified = fetch_classified_news_urls()
+    if already_classified:
+        new_records = [r for r in records if r.get("url") not in already_classified]
+        skipped = len(records) - len(new_records)
+        print(f"  [DEDUP] {skipped}/{len(records)} już sklasyfikowanych w DB — pomijam, klasyfikuję {len(new_records)} nowych")
+    else:
+        new_records = records
+        if not is_csv_only():
+            print(f"  [DEDUP] DB pusta lub niedostępna — klasyfikuję wszystkie {len(records)}")
+
+    # Classify only new headlines with Gemini (graceful — failure = None fields)
+    if new_records:
+        classify_batch(new_records)
     classified = sum(1 for r in records if r.get("category") is not None)
 
     upload_result = upload_news(records)

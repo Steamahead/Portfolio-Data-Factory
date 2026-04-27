@@ -109,5 +109,6 @@ sector_priority:
 
 # ── Gemini LLM classifier settings ────────────────────────────────
 gemini:
-  model: "gemini-2.5-flash"
-  classify_delay_seconds: 1.0
+  model: "gemini-3.1-flash-lite-preview"
+  # Free tier RPM = 15, czyli ~4s/req. 5s = 12 RPM z safety margin.
+  classify_delay_seconds: 5.0
