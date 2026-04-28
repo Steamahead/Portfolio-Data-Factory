@@ -586,7 +586,7 @@ def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, pri
     for attempt in range(3):
         try:
             response = gemini_client.models.generate_content(
-                model="gemini-3-flash-preview",
+                model="gemini-2.5-flash",
                 contents=prompt
             )
             text = response.text if hasattr(response, 'text') else str(response)
