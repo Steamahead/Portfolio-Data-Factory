@@ -552,6 +552,96 @@ def calculate_weighted_averages(articles: list[dict]) -> dict:
 # Stores last LLM error per ticker for diagnostics in alerts
 _last_llm_error: dict[str, dict] = {}
 
+# Structured-output schema mirroring the JSON shape documented in SHILLER_MEGA_PROMPT.
+# Forces Gemini to emit deterministically-valid JSON via constrained decoding,
+# eliminating ad-hoc parse failures we observed on gemini-3-flash-preview.
+SHILLER_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "analysis_metadata": {
+            "type": "OBJECT",
+            "properties": {
+                "ticker": {"type": "STRING"},
+                "company_name": {"type": "STRING"},
+                "analysis_date": {"type": "STRING"},
+                "price": {"type": "NUMBER"},
+                "ma_30": {"type": "NUMBER"},
+                "gap_pct": {"type": "NUMBER"},
+                "articles_received": {"type": "INTEGER"},
+                "articles_included": {"type": "INTEGER"},
+                "articles_excluded": {"type": "INTEGER"},
+            },
+            "required": [
+                "ticker", "company_name", "analysis_date", "price", "ma_30",
+                "gap_pct", "articles_received", "articles_included", "articles_excluded",
+            ],
+        },
+        "articles": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "article_num": {"type": "INTEGER"},
+                    "headline_preview": {"type": "STRING"},
+                    "filter": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "is_about_company": {
+                                "type": "STRING",
+                                "enum": ["PRIMARY", "MENTIONED", "NO"],
+                            },
+                            "sentiment_usable": {
+                                "type": "STRING",
+                                "enum": ["YES", "PARTIAL", "NO"],
+                            },
+                            "hype_usable": {
+                                "type": "STRING",
+                                "enum": ["YES", "PARTIAL", "NO"],
+                            },
+                            "excluded": {"type": "BOOLEAN"},
+                            "exclusion_reason": {"type": "STRING", "nullable": True},
+                        },
+                        "required": [
+                            "is_about_company", "sentiment_usable", "hype_usable",
+                            "excluded", "exclusion_reason",
+                        ],
+                    },
+                    "quality_metrics": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "centrality": {"type": "INTEGER"},
+                            "credibility_sentiment": {"type": "INTEGER"},
+                            "credibility_hype": {"type": "INTEGER"},
+                            "recency": {"type": "INTEGER"},
+                            "materiality": {"type": "INTEGER"},
+                            "speculation_signal": {"type": "INTEGER"},
+                        },
+                        "required": [
+                            "centrality", "credibility_sentiment", "credibility_hype",
+                            "recency", "materiality", "speculation_signal",
+                        ],
+                    },
+                    "scores": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "sentiment_raw": {"type": "NUMBER", "nullable": True},
+                            "hype_raw": {"type": "NUMBER", "nullable": True},
+                        },
+                        "required": ["sentiment_raw", "hype_raw"],
+                    },
+                    "reasoning": {"type": "STRING"},
+                },
+                "required": [
+                    "article_num", "headline_preview", "filter",
+                    "quality_metrics", "scores", "reasoning",
+                ],
+            },
+        },
+    },
+    "required": ["analysis_metadata", "articles"],
+}
+
+
 def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, price_data: dict) -> dict | None:
     valid_headlines = [h for h in headlines if h != "N/A"]
     if not valid_headlines:
@@ -593,6 +683,9 @@ def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, pri
                     thinking_config=genai_types.ThinkingConfig(
                         thinking_level=genai_types.ThinkingLevel.MINIMAL
                     ),
+                    response_mime_type="application/json",
+                    response_schema=SHILLER_RESPONSE_SCHEMA,
+                    temperature=0.1,
                 ),
             )
             # Flash 3.0 may still emit "thoughts" parts even at MINIMAL level;
@@ -633,6 +726,12 @@ def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, pri
             # 5xx — transient (overload, timeout). Worth retrying.
             wait = backoff_schedule[attempt]
             logger.warning(f"Attempt {attempt+1}/3 transient error (HTTP {e.code}): {e}. Retrying in {wait}s...")
+            last_error = e
+            time.sleep(wait)
+
+        except json.JSONDecodeError as e:
+            wait = backoff_schedule[attempt]
+            logger.warning(f"[METRIC] json_decode_failure attempt={attempt+1}/3 ticker={ticker} error={e}. Retrying in {wait}s...")
             last_error = e
             time.sleep(wait)
 
