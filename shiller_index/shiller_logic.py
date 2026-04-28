@@ -19,6 +19,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from google import genai
 from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys as _sys
@@ -587,9 +588,20 @@ def analyze_hype_score(headlines: list[str], ticker: str, company_name: str, pri
         try:
             response = gemini_client.models.generate_content(
                 model="gemini-3-flash-preview",
-                contents=prompt
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    thinking_config=genai_types.ThinkingConfig(
+                        thinking_level=genai_types.ThinkingLevel.MINIMAL
+                    ),
+                ),
             )
-            text = response.text if hasattr(response, 'text') else str(response)
+            # Flash 3.0 may still emit "thoughts" parts even at MINIMAL level;
+            # response.text concatenates everything, so filter to non-thought parts.
+            try:
+                parts = response.candidates[0].content.parts
+                text = "".join(p.text for p in parts if not getattr(p, "thought", False) and p.text)
+            except (AttributeError, IndexError, TypeError):
+                text = response.text if hasattr(response, 'text') else str(response)
             if "```" in text:
                 text = text.replace("```json", "").replace("```", "")
 
