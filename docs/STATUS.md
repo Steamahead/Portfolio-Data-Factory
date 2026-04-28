@@ -80,11 +80,44 @@ Brak — wszystko zacommitowane i wypushowane do origin.
 
 ---
 
-## Następny krok
+## Aktywne wątki (stan 2026-04-24, do kontynuacji)
 
+### 🔥 Inflation Scraper — otwarta decyzja projektowa
+**Kontekst:** Potencjalnie najmocniejszy projekt w roadmapie (patrz Backlog niżej). Każdy rozumie inflację, natychmiastowy hook „GUS mówi X, mój koszyk mówi Y", double-use (własne finanse), zamyka klamrę z Gov Spending. **Time-critical**: time-series potrzebuje czasu, start 2026-04 → maj 2027 = 13 msc danych; start w Q4 2026 = słaby demo.
+
+**Ustalone (mocne):**
+- Start-targets: **Frisco + Carrefour Online + Ceneo + ceny.stat.gov.pl (GUS open data)**. ZERO Biedronka/Lidl na MVP (agresywny anty-bot + ToS violation).
+- ~40 hardcoded URLs, nie dynamiczne kategorie.
+- Primary key = **EAN/barcode**, URL secondary.
+- Schema musi mieć: `price_base`, `promo_active` (bool), `price_promo` (nullable), `package_size`, `unit_price_per_100g`, `store_location`.
+- Monitoring przez istniejący `scraper_monitor`.
+- Cadence: tygodniowy (niedziela rano).
+
+**Otwarte pytanie (czekam na decyzję user):** filozofia koszyka
+- **(A)** GUS-aligned od dnia 1 — wagi kategorii CPI z publikacji GUS + własne mierzone ceny (stratified sampling). Hook: „mój CPI vs ichni CPI". Wymaga researchu upfront.
+- **(B)** „Koszyk Inżyniera" — 40 produktów własnych, equal-weight. Najszybszy start. Zalecany przez drugi LLM („Tech Lead") który skrytykował (A) jako pułapkę juniorską.
+- **(D)** Hybryda (rekomendacja Claude): start jak (B), ale schema od dnia 1 gotowy na ewolucję — po ~6msc mapujesz 40 produktów do kategorii GUS, wagi CPI dają DRUGĄ kolumnę indeksu. Koszt: 2h więcej myślenia nad schemą teraz. Efekt: trzy historie z jednego wysiłku (mój / mój-w-wagach-GUS / oficjalny GUS).
+
+**Uzasadnienie odrzucenia krytyki TL:** TL twierdził że (A) = „udawanie GUS z 40 produktami = arbitralność". To niedoczytanie — (A) to stratified sampling z publicznymi wagami, standardowa metoda (Coface, mBank Research, IBS). Ale TL słusznie wskazał że (B) rusza szybciej — stąd synteza (D).
+
+### LinkedIn — urodziny 2026-05-03 jako symboliczny start
+- Target pierwszego posta: **3 maja 2026** (41. urodziny, za 9 dni od 2026-04-24).
+- Format: *„Dla uczczenia 41-tki — co buduję. Portfolio Data Factory, 7 pipeline'ów, Azure + AI"*.
+- Status: **nie zdecydowane, nie zaczęte**. User ma to potwierdzić / napisać draft.
+
+### Stare punkty (priorytet niższy niż powyższe):
 1. **Token optimization** — plan batch 3 tickery Shillera w 1 request (patrz memory: `project_shiller_token_optimization.md`)
 2. **Zmiana modelu CEE FX + Gov Spending** — na tańszy (Gemini 503 issues)
 3. **Azure firewall** — rozważyć zakres IP zamiast pojedynczych adresów
+
+## Backlog (portfolio-positioning)
+
+- **Job Scrapers: ekstrakcja skillsów przez LLM** — z treści ofert wyciągać listę skillów + trendy (co rośnie/spada w kategoriach data/AI/BA). Double-use: portfolio (senior-level AI-where-it-adds-value) + własny radar rynku pracy. Ground truth = ręczna weryfikacja na ~50 ofertach. Wersja: pilot na NFJ, potem rozszerzyć.
+- **Gov Spending: ewaluacja istniejącego klasyfikatora LLM** — ~100 ręcznie oznaczonych próbek, policzyć precision/recall/F1. Mocny bullet do CV: „evaluation-driven ML, nie wróżenie".
+- **Power BI Executive Dashboard** — jeden raport spinający 7 pipeline'ów w widok wykonawczy (Shiller CAPE+sentyment / CEE FX vol / Gov Spending anomalie / Job Market trendy). Publiczny iframe → LinkedIn-embed. DirectQuery na Azure SQL. ~1 weekend. **Proof-points:** E2E + storytelling. Zamyka „visible front" którego obecnie brakuje.
+- **RAG nad zamówieniami publicznymi** — Q&A nad `gov_spending_radar` z cytatami źródeł (vector DB, orchestracja LangGraph/prostsza, eval Q&A). ~2-3 weekendy. **Unikalny** (urząd-insider + AI + strukturalne dane), trudny do skopiowania. **Proof-points:** AI flagship + prod edge cases.
+- **Kwartalny raport „Data Lens" na LinkedIn** — jednopager z `gov_spending_radar` (top anomalie kwartału, PDF + LinkedIn post + link do dashboardu). Niski koszt techniczny, najwyższy efekt contentowy. Wymaga dyscypliny (jeden skipped quarter psuje wrażenie).
+- **🔥 Inflation Scraper** (patrz „Aktywne wątki" wyżej) — najmocniejszy projekt w roadmapie. Time-critical start. Filozofia koszyka do ustalenia (A/B/D).
 
 ---
 
