@@ -82,23 +82,33 @@ Brak — wszystko zacommitowane i wypushowane do origin.
 
 ## Aktywne wątki (stan 2026-04-24, do kontynuacji)
 
-### 🔥 Inflation Scraper — otwarta decyzja projektowa
-**Kontekst:** Potencjalnie najmocniejszy projekt w roadmapie (patrz Backlog niżej). Każdy rozumie inflację, natychmiastowy hook „GUS mówi X, mój koszyk mówi Y", double-use (własne finanse), zamyka klamrę z Gov Spending. **Time-critical**: time-series potrzebuje czasu, start 2026-04 → maj 2027 = 13 msc danych; start w Q4 2026 = słaby demo.
+### 🔥 Inflation Scraper — DECYZJE ZAMKNIĘTE (2026-04-30) → spec: `docs/INFLATION_BASKET_SPEC.md`
 
-**Ustalone (mocne):**
-- Start-targets: **Frisco + Carrefour Online + Ceneo + ceny.stat.gov.pl (GUS open data)**. ZERO Biedronka/Lidl na MVP (agresywny anty-bot + ToS violation).
-- ~40 hardcoded URLs, nie dynamiczne kategorie.
-- Primary key = **EAN/barcode**, URL secondary.
-- Schema musi mieć: `price_base`, `promo_active` (bool), `price_promo` (nullable), `package_size`, `unit_price_per_100g`, `store_location`.
-- Monitoring przez istniejący `scraper_monitor`.
-- Cadence: tygodniowy (niedziela rano).
+**Otwarte pytania zamknięte:**
+- Filozofia koszyka: **(B)** Inżynier — własne zakupy, equal-weight. Wagi GUS dopiero V2 (= ścieżka D rozłożona w czasie).
+- Sklepy: **Frisco + Auchan zakupy (Warszawa)**. Carrefour/Ceneo wycięte (2 wystarczą; research 2026-04-30 potwierdził feasibility tych dwóch).
+- N produktów: **40** (3-4 per kategoria GUS, threshold reprezentatywności).
+- Cadence: **3× tygodniowo** (pn/śr/pt 22:00) — nie codziennie, sustainability.
+- AI: **NIE w MVP**, V1 dopiero (klasyfikacja kategorii GUS + shrinkflation detection przez Gemini Flash-Lite).
+- Folder: `inflation_basket/`.
+- Start: **teraz** (po sesji 2026-04-30).
 
-**Otwarte pytanie (czekam na decyzję user):** filozofia koszyka
-- **(A)** GUS-aligned od dnia 1 — wagi kategorii CPI z publikacji GUS + własne mierzone ceny (stratified sampling). Hook: „mój CPI vs ichni CPI". Wymaga researchu upfront.
-- **(B)** „Koszyk Inżyniera" — 40 produktów własnych, equal-weight. Najszybszy start. Zalecany przez drugi LLM („Tech Lead") który skrytykował (A) jako pułapkę juniorską.
-- **(D)** Hybryda (rekomendacja Claude): start jak (B), ale schema od dnia 1 gotowy na ewolucję — po ~6msc mapujesz 40 produktów do kategorii GUS, wagi CPI dają DRUGĄ kolumnę indeksu. Koszt: 2h więcej myślenia nad schemą teraz. Efekt: trzy historie z jednego wysiłku (mój / mój-w-wagach-GUS / oficjalny GUS).
+**Harmonogram:** MVP 4 tyg. → V1 +4 tyg. → V2 po 6 mies. zbierania danych (= dual-index mój/GUS, public dashboard, LinkedIn launch).
 
-**Uzasadnienie odrzucenia krytyki TL:** TL twierdził że (A) = „udawanie GUS z 40 produktami = arbitralność". To niedoczytanie — (A) to stratified sampling z publicznymi wagami, standardowa metoda (Coface, mBank Research, IBS). Ale TL słusznie wskazał że (B) rusza szybciej — stąd synteza (D).
+**Sustainability gates** (z konstytucji mental state 2026-04-30): pauza po MVP/V1 dozwolona, stop-signs zdefiniowane w specu §11.
+
+**Status (2026-05-01):**
+- ✅ Wybór produktów: **52 produktów** w `inflation_basket/seed/products.py`
+- ✅ Matching strategy: 29 same_sku + 23 logical_only (po korektach: Erytrytol/Sól → logical_only)
+- ✅ Diversyfikacja dostawców: 24 marek, max 2 produkty per marka
+- ✅ Mini-koszyk importowany: 9 produktów (~17%)
+- ✅ `inflation_basket/db/schema.py` + `db/operations.py` (2-layer retry, MERGE)
+- ✅ Master catalog w Azure SQL — 4 tabele, **52 produkty po re-seed** (post-korekty 2026-05-01)
+- ✅ `inflation_basket/url_mapper.py` (interactive manual fallback) + `auto_mapper.py` (algorithmic, scoring 40/30/30)
+- ⚠️ **Frisco**: subagent zmapował 16/51 (próg 0.7 za sztywny) — re-run z threshold 0.5 + brand bonus po Auchan setup
+- ⏳ **Auchan**: setup w trakcie (Damian uruchamia url_mapper raz, wybiera sklep Warszawa, q)
+- ⏳ Auto-mapper re-run dla obu sklepów (oczekiwane ~40-45 saved per sklep)
+- ⏳ Frisco + Auchan scraper — po URL mapping
 
 ### LinkedIn — urodziny 2026-05-03 jako symboliczny start
 - Target pierwszego posta: **3 maja 2026** (41. urodziny, za 9 dni od 2026-04-24).
