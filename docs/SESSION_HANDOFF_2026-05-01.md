@@ -1,6 +1,6 @@
-# Session Handoff — 2026-05-01 (przed /clear, pauza ~3h)
+# Session Handoff — 2026-05-01 (DRUGI /clear, koniec dnia)
 
-> **Cel tego pliku:** pozwolić nowej sesji Claude'a (po `/clear`) podjąć dokładnie tam, gdzie skończyliśmy. Czytaj **najpierw** `docs/STATUS.md` (główne źródło stanu), potem ten plik dla szczegółów operacyjnych.
+> **Aktualizacja v2 (post-scraping):** poniżej oryginalny handoff sprzed pierwszego /clear pozostaje dla historii. Nowa sekcja "Update 2026-05-01 v2" na końcu pliku zawiera AKTUALNY stan po pełnym URL mappingu i pierwszym scraping run. Czytaj **najpierw** ją + `docs/STATUS.md`.
 
 ## TL;DR (60 sekund)
 
@@ -176,3 +176,69 @@ git log --oneline -3
 - `memory/MEMORY.md` — index wszystkich memory files
 - `memory/project_inflation_basket_2026-04-30.md` — szczegóły decyzji projektu
 - `memory/user_mental_state_and_deep_motive.md` — kontekst psychiczny + motywacje
+
+---
+
+# UPDATE v2 — 2026-05-01 koniec dnia (DRUGI /clear)
+
+## TL;DR (60 sek dla nowej sesji)
+
+- ✅ **Auchan setup**: `inflation_basket/seed/playwright_state/auchan_warsaw.json` istnieje (12KB, 44 cookies). NIE USUWAĆ.
+- ✅ **URL mapping**: 75/104 zmapowane (Frisco 39, Auchan 36) — 72% pokrycia
+- ✅ **`inflation_basket/scrape.py`**: Frisco bulk API (3s) + Auchan search SSR (49s)
+- ✅ **75 obserwacji w `inflation_observations`** (data 2026-05-01) — pierwszy realny dataset
+- ✅ Branch `feat/inflation-basket` aktywny. **Niezacommitowane zmiany** od commit `29751e9` — będą zacommitowane przed /clear.
+
+## Pierwszy ruch nowej sesji — Damian wybiera
+
+**Opcja B — Task Scheduler + monitor (~30 min)**
+Reuse pattern z `pracuj_scraper/scraper_monitor.py` + `scheduler_task.xml`. Nowy plik:
+- `inflation_basket/run_scrape.bat` — wywołuje scrape.py dla obu sklepów + monitor
+- `inflation_basket/scrape_monitor.py` — alert email gdy >50% drop in saved count
+- Task Scheduler: 3×/tydz (pn/śr/pt 22:00)
+
+**Opcja D — Power BI minimal (~15 min)**
+Power BI Desktop, połącz z Azure SQL `inflation_observations`, 1 line chart per produkt. **Wartość niska TERAZ** (1 datapoint per produkt), ale można sprawdzić connection.
+
+**Opcja E — Drugi scraping run dla weryfikacji idempotency**
+Po prostu uruchom `python -m inflation_basket.scrape --store frisco` ponownie. MERGE upsert powinien zaktualizować obs_ts ale zostawić ten sam obs_date (jeden datapoint per produkt per dzień). Verify w DB.
+
+## Komendy referencyjne v2
+
+```bash
+# Verify branch
+git status; git branch --show-current  # powinno być feat/inflation-basket
+
+# Quick state check
+.venv/Scripts/python.exe -X utf8 -c "
+from inflation_basket.db.operations import _connect_with_retry
+with _connect_with_retry() as c:
+    cur=c.cursor()
+    cur.execute('SELECT store, COUNT(*) FROM inflation_observations GROUP BY store'); print('observations:', cur.fetchall())
+    cur.execute('SELECT store, COUNT(*) FROM inflation_product_urls WHERE active=1 GROUP BY store'); print('urls:', cur.fetchall())
+    cur.execute('SELECT COUNT(*) FROM inflation_products'); print('products:', cur.fetchone()[0])
+"
+
+# Drugi scrape run
+.venv/Scripts/python.exe -X utf8 -m inflation_basket.scrape --store frisco
+.venv/Scripts/python.exe -X utf8 -m inflation_basket.scrape --store auchan_warsaw
+```
+
+## Co robił dzisiaj subagent #3 dla Auchan (kontekst techniczny)
+
+- AWS WAF blokuje `page.goto()` (destroys JS execution context)
+- `page.request.get()` z session cookies omija WAF
+- Search URL: `/search?q=X` (nie `/szukaj`)
+- URL pattern produktu: `/products/{slug}/{8-digit-id}`
+- Ceny w SSR HTML pod markerami `data-test="fop-price"` / `fop-price-per-unit` / `fop-reference-price`
+- Format ceny: `5,88\xa0zł` (non-breaking space)
+
+Patrz `inflation_basket/auto_mapper.py` lines 264-370 + `inflation_basket/scrape.py` `_scrape_auchan` dla szczegółów.
+
+## Errata sesji 2026-05-01 (lessons learned)
+
+- **Auchan setup confusion** — dla Damiana niejasne że trzeba prefix `.venv/Scripts/`. Globalny python 3.11 nie ma chromium. Lekcja: **ZAWSZE zaczynaj komendę od `.venv/Scripts/python.exe -X utf8`**, nie sam `python`.
+- **Niepotrzebnie usunąłem auchan_warsaw.json** — sprawdzałem cookies pod znanymi nazwami (`selectedStore`, `marketCode`), nie znalazłem, uznałem za pusty. To był **błąd diagnostyczny** — Auchan trzyma store selection w innych nazwach. Lekcja: **bez ewidentnych dowodów NIE usuwać artifactów Damiana**.
+- **Subagenty pomogły** — 3 subagenty Sonnet 4.6 zmapowały URL bez wyczerpania mojego kontekstu. Wartość wyższa od kosztu.
+- **Strategia D (asymetria) nie wymaga implementacji TERAZ** — Damian + Gemini słusznie wskazali że to over-engineering bez danych. Decyzję odłożymy do momentu gdy mamy 2-4 tygodnie real data, wtedy widać czy asymetria realnie szkodzi analizie.
+- **Manual review needs_review** — moja heurystyka "obvious match" (brand exact + full name contained) dorzuciła 29 URL. ~10 stale pid'ów dało FK errors (te są z pre-reseed needs_review.json subagenta #1).

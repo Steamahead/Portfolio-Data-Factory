@@ -107,15 +107,28 @@ Brak — wszystko zacommitowane i wypushowane do origin.
 - ✅ `inflation_basket/url_mapper.py` (interactive manual fallback) + `auto_mapper.py` (algorithmic, scoring 40/30/30)
 - ✅ **Branch `feat/inflation-basket`** + commit `254cf4a` (11 files, +1633). Pracujemy na branchu, nie main.
 
-**🚧 GDZIE STANĘLIŚMY — następna sesja zaczyna tu:**
-- ⏳ **Auchan setup**: Damian musi uruchomić url_mapper, wybrać sklep Warszawa, zapisać sesję. Plik docelowy: `inflation_basket/seed/playwright_state/auchan_warsaw.json`
-- ⏳ **URL mapping wszystkich 52 produktów × 2 sklepy** — DB obecnie ma 0 URL (po re-seed wszystkie poprzednie 16 zostały DELETED). Po Auchan setup: spawn subagent Sonnet 4.6 z **poprawkami scoring**: threshold 0.7→0.5 dla logical_only, brand exact match bonus +0.2.
-- ⏳ Frisco scraper + Auchan scraper — po URL mapping
-- ⏳ Power BI minimal — po pierwszych obserwacjach
+**Status update 2026-05-01 (DRUGI /clear, koniec dnia):**
+- ✅ **Auchan setup zrobiony** — `inflation_basket/seed/playwright_state/auchan_warsaw.json` istnieje (12KB, 44 cookies)
+- ✅ **URL mapping done — 75/104** (Frisco 39, Auchan 36) przez 3 subagenty + auto-review heurystyka
+- ✅ **`inflation_basket/auto_mapper.py`** — algorithmic z poprawkami scoring (threshold 0.5 logical_only, brand bonus +0.2). Subagent #3 dorzucił Auchan branch używając page.request.get na search SSR HTML (omija AWS WAF który blokuje page.goto)
+- ✅ **`inflation_basket/scrape.py`** — Frisco bulk API (1 request, 3.2s dla 39 produktów), Auchan search SSR z parsing data-test markerów (49s dla 36 produktów)
+- ✅ **Pierwszy scraping run 2026-05-01: 75 obserwacji w `inflation_observations`** (Frisco 39 + Auchan 36, 0 errors)
+- ✅ Branch `feat/inflation-basket`, commit `254cf4a` (scaffold) + `29751e9` (handoff v1) + niezacommitowane zmiany od dziś (auto_mapper Auchan branch + scrape.py + needs_review.json + auto-saved 29 URL z review)
 
-**Pełny handoff (komendy, prompt subagenta, mental state):** patrz `docs/SESSION_HANDOFF_2026-05-01.md`.
-- ⏳ Auto-mapper re-run dla obu sklepów (oczekiwane ~40-45 saved per sklep)
-- ⏳ Frisco + Auchan scraper — po URL mapping
+**🚧 GDZIE STANĘLIŚMY — następna sesja zaczyna tu:**
+- ⏳ **Drugi scraping run** (jutro / pojutrze) — żeby zweryfikować idempotency MERGE i zobaczyć czy ceny się zmieniły dzień po
+- ⏳ **Task Scheduler + scraper_monitor** — automation 3×/tydz (pn/śr/pt 22:00). Reuse pattern z `pracuj_scraper/scraper_monitor.py` + `scheduler_task.xml`
+- ⏳ **Power BI minimal** — po 1-2 tygodniach danych (4-6 datapoints per produkt)
+- ⏳ **29 needs_review URL** — niektóre stale pid'y (FK błędy z pre-reseed Frisco), niektóre prawdziwe puste search results (Auchan: Mango pid 71, Pomidory pid 73, Ogórek pid 75, Sałata pid 78). Decyzja na potem.
+
+**Pierwsze cross-store data points (2026-05-01):**
+- Mleko Łaciate bez laktozy 1L: Frisco 6.09 / Auchan 5.88 (Auchan -3.5%)
+- Masło Łaciate 200g: Frisco 7.49 / Auchan 6.79 (Auchan -9.3%)
+- Cheddar Mlekovita 150g: Frisco 7.49 / Auchan 6.78 (Auchan -9.5%)
+- Twaróg Piątnica 250g: Frisco 6.09 / Auchan 6.69 (Auchan +9.9%)
+- Jogurt Bakoma: Frisco 4.49 / Auchan 4.48 (~0%)
+
+**Pełny handoff (komendy, prompt subagenta, mental state):** patrz `docs/SESSION_HANDOFF_2026-05-01.md` (sekcja Update v2 na końcu).
 
 ### LinkedIn — urodziny 2026-05-03 jako symboliczny start
 - Target pierwszego posta: **3 maja 2026** (41. urodziny, za 9 dni od 2026-04-24).

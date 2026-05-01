@@ -27,7 +27,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from playwright.sync_api import sync_playwright
 
@@ -203,7 +203,14 @@ def score_candidate(prod: dict, cand_name: str, cand_value: float, cand_unit: st
     cap = _cap_score(prod, cand_value, cand_unit, cand_name)
     brand = _brand_score(prod, cand_name)
     name = _name_score(prod, cand_name)
-    return 0.4 * cap + 0.3 * brand + 0.3 * name
+    raw = 0.4 * cap + 0.3 * brand + 0.3 * name
+    # Change B: brand exact match bonus (+0.2, capped at 1.0)
+    brand_str = prod.get("brand") or ""
+    if brand_str:
+        pattern = r"(?<![a-ząćęłńóśźż])" + re.escape(brand_str.lower()) + r"(?![a-ząćęłńóśźż])"
+        if re.search(pattern, cand_name.lower()):
+            raw = min(1.0, raw + 0.2)
+    return raw
 
 
 # ── Frisco search ─────────────────────────────────────────────────────
@@ -255,42 +262,79 @@ def _frisco_candidates(page, prod: dict, n: int = 10) -> list[dict]:
 
 
 # ── Auchan search ─────────────────────────────────────────────────────
+# Approach C: page.request.get() on the SSR search URL (no JS execution).
+# zakupy.auchan.pl = Ocado SPA + AWS WAF.  Direct goto() destroys the JS
+# execution context.  page.request bypasses the runtime and sends a plain
+# HTTP request with session cookies attached.  The SSR HTML contains:
+#  • href="/products/{slug}/{retailerProductId}"  → product URL (HTTP 200 verified)
+#  • "productEntities" in __INITIAL_STATE__ → brand + canonical name (img.description)
 
-def _auchan_candidates(page, prod: dict, n: int = 10) -> list[dict]:
-    query = _frisco_build_query(prod)  # same query builder
-    url = f"https://zakupy.auchan.pl/szukaj?q={quote(query)}"
-    page.goto(url, timeout=20000, wait_until="domcontentloaded")
-    time.sleep(2)
+_CAP_RE = re.compile(
+    r'(\d+(?:[,\.]\d+)?)\s*(kg|g|l\b|ml|litr(?:ów|y|a)?|gram(?:ów|y|a)?|szt(?:uk)?\.?|rolek|sztuk)',
+    re.IGNORECASE,
+)
+_UNIT_NORM = {"kg":"kg","g":"g","l":"l","ml":"ml","litrów":"l","litry":"l","litra":"l",
+              "gramów":"g","gramy":"g","grama":"g","szt":"szt","szt.":"szt",
+              "sztuk":"szt","sztuka":"szt","rolek":"rolek"}
 
-    # Parse __INITIAL_STATE__ or product cards
-    html = page.content()
-    state_m = re.search(r"window\.__INITIAL_STATE__\s*=\s*(\{.+?\});\s*</script>", html, re.DOTALL)
+
+def _parse_capacity(name: str) -> tuple[float, str]:
+    m = _CAP_RE.search(name)
+    if not m:
+        return 0.0, "szt"
+    unit = _UNIT_NORM.get(m.group(2).lower().rstrip("."), m.group(2).lower())
+    return float(m.group(1).replace(",", ".")), unit
+
+
+def _auchan_candidates(page, prod: dict, n: int = 15) -> list[dict]:
+    """Fetch via page.request on the SSR search page (no JS execution needed)."""
+    query = _frisco_build_query(prod)
+    resp = page.request.get(
+        f"https://zakupy.auchan.pl/search?q={quote(query)}", timeout=25000
+    )
+    if resp.status != 200:
+        raise RuntimeError(f"Auchan search HTTP {resp.status} for {query!r}")
+    html = resp.text()
+
+    # Extract product hrefs: /products/{slug}/{8-digit-id}
+    seen: set[str] = set()
+    href_rows = []
+    for m in re.finditer(r'href="(/products/([^/"]+)/([0-9]{8,9}))"', html):
+        rid = m.group(3)
+        if rid not in seen:
+            seen.add(rid)
+            href_rows.append((m.group(1), unquote(m.group(2)), rid))
+
+    # Build brand + canonical-name map from productEntities in __INITIAL_STATE__
+    entity_map: dict[str, dict] = {}
+    pe_idx = html.find('"productEntities":{"')
+    if pe_idx < 0:
+        pe_idx = html.find('"productEntities": {"')
+    if pe_idx >= 0:
+        chunk = html[pe_idx : pe_idx + 600_000]
+        for m in re.finditer(
+            r'"retailerProductId"\s*:\s*"([0-9]{8,9})"[^}]*?"brand"\s*:\s*"([^"]*)"',
+            chunk, re.DOTALL
+        ):
+            entity_map.setdefault(m.group(1), {})["brand"] = m.group(2)
+        for m in re.finditer(
+            r'"retailerProductId"\s*:\s*"([0-9]{8,9})".*?"description"\s*:\s*"([^"]{3,120})"',
+            chunk, re.DOTALL
+        ):
+            entity_map.setdefault(m.group(1), {})["img_name"] = m.group(2)
+
     results = []
-    if state_m:
-        try:
-            state = json.loads(state_m.group(1))
-            products = (
-                state.get("catalog", {}).get("products", [])
-                or state.get("search", {}).get("products", [])
-                or []
-            )
-            for p in products[:n]:
-                name = p.get("name", "")
-                pid = str(p.get("id", p.get("productId", "")))
-                slug = p.get("slug", "")
-                purl = f"https://zakupy.auchan.pl/shop/p/{slug}-{pid}" if slug else f"https://zakupy.auchan.pl/shop/p/{pid}"
-                cap = p.get("grammage") or p.get("capacity") or 0
-                unit = p.get("unitOfMeasure", "szt")
-                results.append({"name": name, "url": purl, "sku": pid, "value": float(cap), "unit": unit.lower()})
-        except Exception:
-            pass
-
-    if not results:
-        # Fallback: parse anchor tags
-        links = re.findall(r'href="(https://zakupy\.auchan\.pl/[^"]+)"[^>]*>[^<]*<[^>]+>([^<]{3,80})<', html)
-        for href, text in links[:n]:
-            results.append({"name": text.strip(), "url": href, "sku": _extract_sku("auchan_warsaw", href), "value": 0.0, "unit": "szt"})
-
+    for full_path, slug, rid in href_rows[:n]:
+        ent = entity_map.get(rid, {})
+        name = ent.get("img_name") or slug.replace("-", " ").strip()
+        brand = ent.get("brand", "")
+        if brand and brand.lower() not in name.lower():
+            name = f"{brand} {name}".strip()
+        value, unit = _parse_capacity(name)
+        results.append({
+            "name": name, "url": f"https://zakupy.auchan.pl{full_path}",
+            "sku": rid, "value": value, "unit": unit,
+        })
     return results
 
 
@@ -393,14 +437,20 @@ def run(store: str, dry_run: bool = False) -> None:
                 continue
 
             key = f"{pid}__{store}"
-            if best_score >= 0.7:
+            # Change A: split threshold by matching_type
+            mtype = prod.get("matching_type", "same_sku")
+            save_threshold = 0.5 if mtype == "logical_only" else 0.7
+            review_threshold = save_threshold - 0.3  # 0.2 for logical_only, 0.4 for same_sku
+
+            if best_score >= save_threshold:
                 sku = best.get("sku") or _extract_sku(store, best["url"])
                 upsert_product_url(pid, store, best["url"], sku, active=True)
                 saved += 1
                 print(f"  SAVED   {label} -> score={best_score:.2f} url={best['url'][:80]}")
-            elif best_score >= 0.4:
+            elif best_score >= review_threshold:
                 review["needs_review"][key] = {
                     "product_id": pid, "name": name, "brand": brand,
+                    "matching_type": mtype,
                     "top3": [{"score": sc, "name": c["name"], "url": c["url"], "value": c["value"], "unit": c["unit"]} for sc, c in scored[:3]],
                 }
                 needs_review += 1
@@ -409,6 +459,7 @@ def run(store: str, dry_run: bool = False) -> None:
             else:
                 review["unavailable"][key] = {
                     "product_id": pid, "name": name, "brand": brand,
+                    "matching_type": mtype,
                     "best_score": best_score,
                     "best_candidate": best["name"][:80] if best else None,
                 }
