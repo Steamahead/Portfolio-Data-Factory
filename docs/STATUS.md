@@ -97,16 +97,23 @@ Brak — wszystko zacommitowane i wypushowane do origin.
 
 **Sustainability gates** (z konstytucji mental state 2026-04-30): pauza po MVP/V1 dozwolona, stop-signs zdefiniowane w specu §11.
 
-**Status (2026-05-01):**
+**Status (2026-05-01, koniec sesji — pauza ~3h, /clear wykonany):**
 - ✅ Wybór produktów: **52 produktów** w `inflation_basket/seed/products.py`
-- ✅ Matching strategy: 29 same_sku + 23 logical_only (po korektach: Erytrytol/Sól → logical_only)
-- ✅ Diversyfikacja dostawców: 24 marek, max 2 produkty per marka
-- ✅ Mini-koszyk importowany: 9 produktów (~17%)
+- ✅ Matching strategy: 29 same_sku + 23 logical_only (po korektach: Erytrytol/Sól → logical_only z brand=None)
+- ✅ Diversyfikacja dostawców: 24 marki, max 2 produkty per marka
+- ✅ Mini-koszyk importowany: 9 produktów (~17%) — Grana Padano IT, Mutti IT, Monini IT, Granoro IT, Kalamata GR, banany EC, awokado/cytryny ES, mango BR
 - ✅ `inflation_basket/db/schema.py` + `db/operations.py` (2-layer retry, MERGE)
-- ✅ Master catalog w Azure SQL — 4 tabele, **52 produkty po re-seed** (post-korekty 2026-05-01)
+- ✅ Master catalog w Azure SQL — 4 tabele, **52 produkty po DELETE+re-seed**
 - ✅ `inflation_basket/url_mapper.py` (interactive manual fallback) + `auto_mapper.py` (algorithmic, scoring 40/30/30)
-- ⚠️ **Frisco**: subagent zmapował 16/51 (próg 0.7 za sztywny) — re-run z threshold 0.5 + brand bonus po Auchan setup
-- ⏳ **Auchan**: setup w trakcie (Damian uruchamia url_mapper raz, wybiera sklep Warszawa, q)
+- ✅ **Branch `feat/inflation-basket`** + commit `254cf4a` (11 files, +1633). Pracujemy na branchu, nie main.
+
+**🚧 GDZIE STANĘLIŚMY — następna sesja zaczyna tu:**
+- ⏳ **Auchan setup**: Damian musi uruchomić url_mapper, wybrać sklep Warszawa, zapisać sesję. Plik docelowy: `inflation_basket/seed/playwright_state/auchan_warsaw.json`
+- ⏳ **URL mapping wszystkich 52 produktów × 2 sklepy** — DB obecnie ma 0 URL (po re-seed wszystkie poprzednie 16 zostały DELETED). Po Auchan setup: spawn subagent Sonnet 4.6 z **poprawkami scoring**: threshold 0.7→0.5 dla logical_only, brand exact match bonus +0.2.
+- ⏳ Frisco scraper + Auchan scraper — po URL mapping
+- ⏳ Power BI minimal — po pierwszych obserwacjach
+
+**Pełny handoff (komendy, prompt subagenta, mental state):** patrz `docs/SESSION_HANDOFF_2026-05-01.md`.
 - ⏳ Auto-mapper re-run dla obu sklepów (oczekiwane ~40-45 saved per sklep)
 - ⏳ Frisco + Auchan scraper — po URL mapping
 
