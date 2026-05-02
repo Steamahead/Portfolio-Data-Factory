@@ -112,18 +112,19 @@ Brak — wszystko zacommitowane i wypushowane do origin.
   (z 60% przed sesją — uzupełnione przez manualny mapping 29 URL + 12 korekt master catalog: brand/name/matching_type/capacity)
 - ✅ **`inflation_basket/scrape.py` — slug-based query dla Auchan** (URL slug → indexable terms; lepsze niż `name_canonical`). Naprawia 7/9 błędów z pierwszego runu.
 - ✅ **2026-05-02: 104 obserwacji w DB** (Frisco 52, Auchan 52, 0 errors). Idempotency MERGE potwierdzona — wczorajsze 75 obs (2026-05-01) nietknięte.
-- ✅ **Task Scheduler skonfigurowany** (Mon/Wed/Fri 22:00):
+- ✅ **Task Scheduler bundle gotowy** (struktura jak Pracuj, ale strict 3×/tydz pn/śr/pt 22:00 — bez LogonTrigger, żeby egzekwować sustainability gate ze spec'u):
   - `inflation_basket/scrape_monitor.py` — wrapper z email alerts (próg 90%)
-  - `run_inflation_scrape.bat` — entry + log rotation 60 dni
-  - `scheduler_inflation_task.xml` — ScheduleByWeek pn/śr/pt
-  - `setup_inflation_scheduler.ps1` — idempotent register (admin)
-- ✅ Branch `feat/inflation-basket` HEAD: (commit po tej sesji)
+  - `run_inflation_scrape.bat` — entry + log rotation 60 dni (`inflation_basket/logs/`)
+  - `scheduler_inflation_task.xml` — CalendarTrigger ScheduleByWeek pn/śr/pt 22:00 (`StartWhenAvailable=true` = missed run catch-up gdy laptop był wyłączony, BEZ duplikacji)
+  - `setup_inflation_scheduler.ps1` — idempotent register (potrzebuje admin)
+- ✅ **SMTP sanity OK** — Damian potwierdził `--test-email` działa (2026-05-02)
+- ✅ Commit `51ad501` na branchu `feat/inflation-basket`
 
 **🚧 GDZIE STANĘLIŚMY — następna sesja:**
-- ⏳ **Damian zarejestruje Task** — `PowerShell -ExecutionPolicy Bypass -File setup_inflation_scheduler.ps1` jako admin (jednorazowo). Pierwszy auto-run: poniedziałek 2026-05-04 22:00.
-- ⏳ **`--test-email`** — sanity check SMTP przed pierwszym auto-runem
-- ⏳ **Power BI minimal** — po 1-2 tyg danych (4-6 datapoints per produkt)
-- ⏳ **Merge `feat/inflation-basket` → main** — gdy MVP soak okaże stabilność (po 1-2 tyg auto-runs)
+- ⏳ **Damian rejestruje Task** (admin PowerShell): `PowerShell -ExecutionPolicy Bypass -File setup_inflation_scheduler.ps1`. Pierwszy auto-run: poniedziałek 2026-05-04 22:00, potem śr 06, pt 08, pn 11, ...
+- ⏳ **Power BI minimal** — po 1-2 tyg danych (7-14 datapoints/produkt). Połącz z Azure SQL → `inflation_observations` → 1 line chart per produkt.
+- ⏳ **Merge `feat/inflation-basket` → main** — gdy MVP soak okaże stabilność (po 1-2 tyg auto-runs).
+- ⏳ (V1, +4 tyg) AI klasyfikacja kategorii GUS + shrinkflation detection (Gemini Flash-Lite).
 
 **Pierwsze cross-store data points (2026-05-01):**
 - Mleko Łaciate bez laktozy 1L: Frisco 6.09 / Auchan 5.88 (Auchan -3.5%)
