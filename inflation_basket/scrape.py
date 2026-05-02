@@ -16,7 +16,7 @@ import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from playwright.sync_api import sync_playwright
 
@@ -280,6 +280,34 @@ def _auchan_parse_price(chunk: str) -> Optional[dict]:
     }
 
 
+_AUCHAN_QUERY_STOPS = {
+    "auchan", "na", "wagę", "wage", "ok", "luz", "sztuka", "szt",
+    "g", "kg", "l", "ml", "całe", "do", "i", "jodowana", "rolek",
+    "pakowane", "próżniowo", "prozniowo", "warzywa", "owoce",
+}
+
+
+def _slug_query_from_url(url: str, max_words: int = 5) -> Optional[str]:
+    """Extract a search query from the product URL slug.
+
+    Pattern: /products/{slug}/{rid}. Empirically (2026-05-02), Auchan search
+    indexes the slug words much better than our `name_canonical`, especially
+    for branded items where our query word order differs from theirs.
+    """
+    m = re.search(r"/products/([^/]+)/\d{8}", url)
+    if not m:
+        return None
+    slug = unquote(m.group(1)).replace("-", " ")
+    words = [
+        w for w in slug.split()
+        if w.lower() not in _AUCHAN_QUERY_STOPS
+        and not w.replace(",", "").replace(".", "").isdigit()
+    ]
+    if not words:
+        return None
+    return " ".join(words[:max_words])
+
+
 def _auchan_search_html(page, query: str) -> str:
     url = f"https://zakupy.auchan.pl/search?q={quote(query)}"
     resp = page.request.get(url, headers={"Accept": "text/html"}, timeout=25000)
@@ -314,9 +342,14 @@ def _scrape_auchan(products: list[dict]) -> tuple[list[dict], list[tuple]]:
 
     print(f"[auchan_warsaw] Scraping {len(products)} products via search SSR...")
 
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        ctx = browser.new_context(storage_state=str(state_file), locale="pl-PL")
+        ctx = browser.new_context(storage_state=str(state_file), locale="pl-PL", user_agent=ua)
         page = ctx.new_page()
         try:
             page.goto(HOMEPAGE["auchan_warsaw"], wait_until="domcontentloaded", timeout=20000)
@@ -328,14 +361,28 @@ def _scrape_auchan(products: list[dict]) -> tuple[list[dict], list[tuple]]:
             try:
                 brand = (p.get("brand") or "").strip()
                 name = p["name_canonical"]
-                query = f"{brand} {name}".strip()
                 rid = p.get("sku_store")
                 if not rid:
                     errors.append((p["product_id"], name, "no sku_store"))
                     continue
 
-                html = _auchan_search_html(page, query)
-                chunk = _auchan_extract_card(html, rid)
+                # Primary: slug-derived query (matches Auchan's own indexing).
+                # Fallback: brand + name_canonical (legacy, for products
+                # whose URL slug stripped down to nothing).
+                queries = []
+                slug_q = _slug_query_from_url(p.get("url", ""))
+                if slug_q:
+                    queries.append(slug_q)
+                queries.append(f"{brand} {name}".strip())
+
+                chunk = None
+                for q in queries:
+                    html = _auchan_search_html(page, q)
+                    chunk = _auchan_extract_card(html, rid)
+                    if chunk is not None:
+                        break
+                    time.sleep(0.4)
+
                 if chunk is None:
                     errors.append((p["product_id"], name, "card not found by rid"))
                     continue

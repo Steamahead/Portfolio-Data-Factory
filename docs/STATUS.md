@@ -107,19 +107,23 @@ Brak — wszystko zacommitowane i wypushowane do origin.
 - ✅ `inflation_basket/url_mapper.py` (interactive manual fallback) + `auto_mapper.py` (algorithmic, scoring 40/30/30)
 - ✅ **Branch `feat/inflation-basket`** + commit `254cf4a` (11 files, +1633). Pracujemy na branchu, nie main.
 
-**Status update 2026-05-01 (DRUGI /clear, koniec dnia):**
-- ✅ **Auchan setup zrobiony** — `inflation_basket/seed/playwright_state/auchan_warsaw.json` istnieje (12KB, 44 cookies)
-- ✅ **URL mapping done — 75/104** (Frisco 39, Auchan 36) przez 3 subagenty + auto-review heurystyka
-- ✅ **`inflation_basket/auto_mapper.py`** — algorithmic z poprawkami scoring (threshold 0.5 logical_only, brand bonus +0.2). Subagent #3 dorzucił Auchan branch używając page.request.get na search SSR HTML (omija AWS WAF który blokuje page.goto)
-- ✅ **`inflation_basket/scrape.py`** — Frisco bulk API (1 request, 3.2s dla 39 produktów), Auchan search SSR z parsing data-test markerów (49s dla 36 produktów)
-- ✅ **Pierwszy scraping run 2026-05-01: 75 obserwacji w `inflation_observations`** (Frisco 39 + Auchan 36, 0 errors)
-- ✅ Branch `feat/inflation-basket`, commit `254cf4a` (scaffold) + `29751e9` (handoff v1) + niezacommitowane zmiany od dziś (auto_mapper Auchan branch + scrape.py + needs_review.json + auto-saved 29 URL z review)
+**Status update 2026-05-02 (sesja domykająca MVP):**
+- ✅ **100% pokrycie cross-store: 52/52 produktów × 2 sklepy = 104/104 active URLs**
+  (z 60% przed sesją — uzupełnione przez manualny mapping 29 URL + 12 korekt master catalog: brand/name/matching_type/capacity)
+- ✅ **`inflation_basket/scrape.py` — slug-based query dla Auchan** (URL slug → indexable terms; lepsze niż `name_canonical`). Naprawia 7/9 błędów z pierwszego runu.
+- ✅ **2026-05-02: 104 obserwacji w DB** (Frisco 52, Auchan 52, 0 errors). Idempotency MERGE potwierdzona — wczorajsze 75 obs (2026-05-01) nietknięte.
+- ✅ **Task Scheduler skonfigurowany** (Mon/Wed/Fri 22:00):
+  - `inflation_basket/scrape_monitor.py` — wrapper z email alerts (próg 90%)
+  - `run_inflation_scrape.bat` — entry + log rotation 60 dni
+  - `scheduler_inflation_task.xml` — ScheduleByWeek pn/śr/pt
+  - `setup_inflation_scheduler.ps1` — idempotent register (admin)
+- ✅ Branch `feat/inflation-basket` HEAD: (commit po tej sesji)
 
-**🚧 GDZIE STANĘLIŚMY — następna sesja zaczyna tu:**
-- ⏳ **Drugi scraping run** (jutro / pojutrze) — żeby zweryfikować idempotency MERGE i zobaczyć czy ceny się zmieniły dzień po
-- ⏳ **Task Scheduler + scraper_monitor** — automation 3×/tydz (pn/śr/pt 22:00). Reuse pattern z `pracuj_scraper/scraper_monitor.py` + `scheduler_task.xml`
-- ⏳ **Power BI minimal** — po 1-2 tygodniach danych (4-6 datapoints per produkt)
-- ⏳ **29 needs_review URL** — niektóre stale pid'y (FK błędy z pre-reseed Frisco), niektóre prawdziwe puste search results (Auchan: Mango pid 71, Pomidory pid 73, Ogórek pid 75, Sałata pid 78). Decyzja na potem.
+**🚧 GDZIE STANĘLIŚMY — następna sesja:**
+- ⏳ **Damian zarejestruje Task** — `PowerShell -ExecutionPolicy Bypass -File setup_inflation_scheduler.ps1` jako admin (jednorazowo). Pierwszy auto-run: poniedziałek 2026-05-04 22:00.
+- ⏳ **`--test-email`** — sanity check SMTP przed pierwszym auto-runem
+- ⏳ **Power BI minimal** — po 1-2 tyg danych (4-6 datapoints per produkt)
+- ⏳ **Merge `feat/inflation-basket` → main** — gdy MVP soak okaże stabilność (po 1-2 tyg auto-runs)
 
 **Pierwsze cross-store data points (2026-05-01):**
 - Mleko Łaciate bez laktozy 1L: Frisco 6.09 / Auchan 5.88 (Auchan -3.5%)
