@@ -168,9 +168,12 @@ def build_html(results: list[dict], report: dict, verdict: dict, elapsed_s: floa
                          [("name", "Nazwa"), ("store", "Sklep"),
                           ("capacity_prev", "Cap prev"), ("capacity_now", "Cap now"),
                           ("price_change_pct", "Δ price %"), ("severity", "Sev")])
-    metrics_html += _tbl("Cross-store anomalie", report.get("cross_store_anomalies", []),
-                         [("name", "Nazwa"), ("frisco_price", "Frisco"),
-                          ("auchan_price", "Auchan"), ("delta_pct", "Δ %"), ("severity", "Sev")])
+    metrics_html += _tbl("Cross-store snapshot (24 produkty branded/fresh)", report.get("cross_store_anomalies", []),
+                         [("name", "Nazwa"), ("brand", "Marka"),
+                          ("frisco_price", "F pkg"), ("auchan_price", "A pkg"),
+                          ("frisco_unit_price", "F u/baza"), ("auchan_unit_price", "A u/baza"),
+                          ("capacity_unit", "Baza"),
+                          ("delta_pct", "Δ %"), ("cheaper", "Tańszy")])
 
     # Promo flips one-liner
     flips = report.get("promo_flips", {})
@@ -179,12 +182,66 @@ def build_html(results: list[dict], report: dict, verdict: dict, elapsed_s: floa
         parts = [f"{s}: +{v['entered']} / -{v['left']}" for s, v in flips.items()]
         flips_html = f"<p style='font-size:12px;color:#666;'>Promo flips: {' | '.join(parts)}</p>"
 
+    # Headline basket index — sum of price_regular per store today vs last prior scrape,
+    # restricted to products in both runs. This is the dashboard KPI in miniature.
+    basket = report.get("basket_index", [])
+    basket_html = ""
+    if basket:
+        basket_rows = ""
+        for b in basket:
+            d = b.get("delta_pct")
+            if d is None:
+                d_str = "-"
+                d_color = "#888"
+            else:
+                arrow = "▲" if d > 0 else ("▼" if d < 0 else "→")
+                d_color = "#dc3545" if d > 0 else ("#28a745" if d < 0 else "#888")
+                d_str = f"{arrow} {d:+.2f}%"
+            basket_rows += (
+                f"<tr style='border-top:1px solid #eee;'>"
+                f"<td style='padding:6px 10px;font-weight:bold;'>{b['store']}</td>"
+                f"<td style='padding:6px 10px;'>{b['products_compared']} produktów</td>"
+                f"<td style='padding:6px 10px;'>{b['prev_total']:.2f} → <strong>{b['now_total']:.2f}</strong> zł</td>"
+                f"<td style='padding:6px 10px;color:{d_color};font-weight:bold;'>{d_str}</td>"
+                f"</tr>"
+            )
+        prev_d = basket[0].get("prev_date", "?")
+        basket_html = (
+            f"<h3>Koszyk inflacyjny — vs {prev_d}</h3>"
+            f"<table style='border-collapse:collapse;width:100%;background:#f9f9f9;font-size:13px;'>{basket_rows}</table>"
+        )
+
+    # Top-of-email banner for products at warning/critical missing severity —
+    # otherwise the signal is buried inside the metrics table.
+    loud_missing = [m for m in report.get("missing_today", []) if m.get("severity") in ("warning", "critical")]
+    loud_html = ""
+    if loud_missing:
+        items = ""
+        for m in loud_missing:
+            d = m.get("days_since")
+            sev = (m.get("severity") or "").upper()
+            items += (f"<li style='margin-bottom:4px;'><strong>{m.get('name','?')}</strong> "
+                      f"({m.get('store','?')}) — <strong>{d} dni</strong> bez obserwacji "
+                      f"<span style='color:#dc3545;'>[{sev}]</span></li>")
+        loud_html = (
+            "<div style='background:#fff3cd;border:2px solid #dc3545;border-radius:6px;"
+            "padding:12px 16px;margin:14px 0;'>"
+            "<h3 style='color:#dc3545;margin:0 0 8px 0;'>"
+            f"PRODUKTY ZNIKAJĄ ({len(loud_missing)}) — wymagana akcja</h3>"
+            f"<ul style='margin:0;padding-left:20px;color:#333;'>{items}</ul>"
+            "</div>"
+        )
+
     return f"""<html><body style="font-family:Segoe UI,Arial;max-width:700px;color:#333;">
     <h2 style="color:{color};">[{icon}{intervention}] Inflation Basket — {ts}</h2>
     <p style="background:#f0f0f0;padding:10px;border-left:4px solid {color};font-size:14px;">
       <strong>Werdykt LLM:</strong> {verdict.get('summary_pl', '(brak)')}
     </p>
     <p>Czas: {elapsed_s:.1f}s</p>
+
+    {basket_html}
+
+    {loud_html}
 
     <h3>Coverage per store</h3>
     <table style="border-collapse:collapse;width:100%;background:#f9f9f9;">{rows_html}</table>

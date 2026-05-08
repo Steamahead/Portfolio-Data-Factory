@@ -13,15 +13,13 @@ from inflation_basket.db.operations import _connect_with_retry
 
 
 THRESHOLDS = {
-    "missing_warning_days": 4,
-    "missing_critical_days": 8,
+    "missing_warning_days": 3,
+    "missing_critical_days": 4,
     "stale_warning_cycles": 6,
     "stale_critical_cycles": 10,
     "price_move_warning_pct": 15.0,
     "price_move_critical_pct": 40.0,
     "shrinkflation_capacity_drop_pct": 5.0,
-    "cross_store_delta_warning_pct": 50.0,
-    "cross_store_delta_critical_pct": 100.0,
 }
 
 
@@ -217,37 +215,116 @@ def _shrinkflation_candidates(cur, today: date) -> list[dict]:
 
 
 def _cross_store_anomalies(cur, today: date) -> list[dict]:
-    """Same product in both stores, |delta|/min > threshold."""
-    warn = THRESHOLDS["cross_store_delta_warning_pct"]
-    crit = THRESHOLDS["cross_store_delta_critical_pct"]
+    """Cross-store snapshot for products flagged cross_store_eligible.
+
+    Returns ALL eligible products (not just those exceeding a threshold).
+    Severity is always 'info' — this is a dashboard widget feed, not an
+    anomaly detector. Sort by delta_pct desc so the largest gaps appear first.
+    """
     cur.execute(
         """
-        WITH t AS (SELECT product_id, store, price_regular FROM inflation_observations WHERE obs_date = ?)
-        SELECT f.product_id, p.name_canonical, p.brand,
-               f.price_regular, a.price_regular
+        WITH t AS (
+            SELECT product_id, store, price_regular, unit_price
+            FROM inflation_observations WHERE obs_date = ?
+        )
+        SELECT f.product_id, p.name_canonical, p.brand, p.capacity_unit,
+               f.price_regular, a.price_regular,
+               f.unit_price, a.unit_price
         FROM t f JOIN t a ON a.product_id = f.product_id
         JOIN inflation_products p ON p.product_id = f.product_id
         WHERE f.store = 'frisco' AND a.store = 'auchan_warsaw'
+          AND p.cross_store_eligible = 1
         """,
         (today,),
     )
     rows = []
     for r in cur.fetchall():
-        f_price, a_price = float(r[3]), float(r[4])
-        if min(f_price, a_price) <= 0:
-            continue
-        delta_pct = abs(f_price - a_price) / min(f_price, a_price) * 100.0
-        if delta_pct < warn:
-            continue
-        sev = "critical" if delta_pct >= crit else "warning"
+        pid, name, brand, cap_unit = r[0], r[1], r[2] or "", r[3]
+        f_price, a_price = float(r[4]), float(r[5])
+        f_unit = float(r[6]) if r[6] is not None else None
+        a_unit = float(r[7]) if r[7] is not None else None
+
+        if f_unit is not None and a_unit is not None and min(f_unit, a_unit) > 0:
+            delta_pct = abs(f_unit - a_unit) / min(f_unit, a_unit) * 100.0
+            basis = "unit_price"
+        elif min(f_price, a_price) > 0:
+            delta_pct = abs(f_price - a_price) / min(f_price, a_price) * 100.0
+            basis = "price_regular"
+        else:
+            delta_pct = None
+            basis = "no_data"
+
+        cheaper = None
+        if delta_pct is not None:
+            ref_f = f_unit if f_unit is not None else f_price
+            ref_a = a_unit if a_unit is not None else a_price
+            cheaper = "frisco" if ref_f < ref_a else ("auchan_warsaw" if ref_a < ref_f else "tie")
+
         rows.append({
-            "product_id": r[0], "name": r[1], "brand": r[2] or "",
+            "product_id": pid, "name": name, "brand": brand,
+            "capacity_unit": cap_unit,
             "frisco_price": round(f_price, 2),
             "auchan_price": round(a_price, 2),
-            "delta_pct": round(delta_pct, 1),
-            "severity": sev,
+            "frisco_unit_price": round(f_unit, 4) if f_unit is not None else None,
+            "auchan_unit_price": round(a_unit, 4) if a_unit is not None else None,
+            "delta_pct": round(delta_pct, 1) if delta_pct is not None else None,
+            "basis": basis,
+            "cheaper": cheaper,
+            "severity": "info",
         })
-    rows.sort(key=lambda x: x["delta_pct"], reverse=True)
+
+    rows.sort(key=lambda x: (x["delta_pct"] is None, -(x["delta_pct"] or 0)))
+    return rows
+
+
+def _basket_index(cur, today: date) -> list[dict]:
+    """Per-store basket total today vs last prior scrape.
+
+    Restricted to products observed in BOTH runs so adding/removing a product
+    does not artificially move the index — the headline KPI for the dashboard
+    must reflect price drift, not catalog churn.
+    """
+    cur.execute(
+        "SELECT MAX(obs_date) FROM inflation_observations WHERE obs_date < ?",
+        (today,),
+    )
+    row = cur.fetchone()
+    prev_date = row[0] if row else None
+    if prev_date is None:
+        return []
+
+    cur.execute(
+        """
+        WITH common AS (
+            SELECT t.store, t.product_id,
+                   t.price_regular AS now_p, p.price_regular AS prev_p
+            FROM inflation_observations t
+            JOIN inflation_observations p
+              ON p.product_id = t.product_id AND p.store = t.store
+             AND p.obs_date = ?
+            WHERE t.obs_date = ?
+        )
+        SELECT store, COUNT(*) AS n,
+               SUM(now_p) AS now_total, SUM(prev_p) AS prev_total
+        FROM common
+        GROUP BY store
+        """,
+        (prev_date, today),
+    )
+    rows = []
+    for r in cur.fetchall():
+        store, n = r[0], int(r[1])
+        now_total = float(r[2]) if r[2] is not None else 0.0
+        prev_total = float(r[3]) if r[3] is not None else 0.0
+        delta_pct = (now_total - prev_total) / prev_total * 100.0 if prev_total > 0 else None
+        rows.append({
+            "store": store,
+            "products_compared": n,
+            "now_total": round(now_total, 2),
+            "prev_total": round(prev_total, 2),
+            "prev_date": prev_date.isoformat(),
+            "delta_pct": round(delta_pct, 2) if delta_pct is not None else None,
+        })
     return rows
 
 
@@ -262,6 +339,7 @@ def build_quality_report(today_results: list[dict], today: date | None = None) -
             "scrape_results": today_results,
             "thresholds": THRESHOLDS,
             "coverage": _coverage(cur, today),
+            "basket_index": _basket_index(cur, today),
             "missing_today": _missing_today(cur, today),
             "price_moves": _price_moves(cur, today),
             "promo_flips": _promo_flips(cur, today),

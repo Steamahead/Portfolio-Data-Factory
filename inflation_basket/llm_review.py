@@ -70,7 +70,8 @@ Progi w `thresholds`:
 - price_move: |pct_change| >= price_move_critical_pct → najpewniej parser fail lub ekstremalna promocja
 - stale_prices >= stale_critical_cycles → URL może być dead, sklep zwraca cache
 - shrinkflation: capacity_drop bez proporcjonalnej obniżki ceny = realny shrinkflation alert
-- cross_store: delta >= cross_store_delta_critical_pct → bardzo duża różnica, sprawdź czy parser dobrze odczytał capacity
+- basket_index: per-store SUM(price_regular) dziś vs poprzedni scrape, zawężone do produktów obecnych w obu runach. To jest headline KPI dashboardu — duże skoki (>3% z dnia na dzień) zgłoś jako concern, ale dopiero przy >5% jako critical (3x/tydz cykl, naturalne fluktuacje cen są w tym zakresie)
+- cross_store_anomalies: snapshot 24 produktów eligible (branded + fresh produce). severity ZAWSZE `info`, pole `cheaper` wskazuje tańszy sklep. To NIE jest detektor anomalii — to widget feed dashboardu, NIE traktuj jako concern do raportowania nawet przy dużych delta_pct.
 
 Pisz po polsku, zwięźle. Dla każdego concern podaj KONKRETNĄ akcję (np. "Sprawdź URL Frisco dla ID 89 — produkt mógł zniknąć z oferty").
 
