@@ -149,6 +149,12 @@ def _scrape_frisco(products: list[dict]) -> tuple[list[dict], list[tuple]]:
     today = date.today()
     now = datetime.utcnow()
 
+    # Surface NULL sku_store as an error instead of silently dropping — otherwise
+    # the product vanishes from coverage without showing up in error_samples.
+    for p in products:
+        if not p.get("sku_store"):
+            errors.append((p["product_id"], p.get("name_canonical", "?"), "missing sku_store in DB (URL mapped without productId)"))
+
     sku_list = [p["sku_store"] for p in products if p.get("sku_store")]
     sku_to_meta = {p["sku_store"]: p for p in products if p.get("sku_store")}
 
