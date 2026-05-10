@@ -15,8 +15,8 @@ from inflation_basket.db.operations import _connect_with_retry
 THRESHOLDS = {
     "missing_warning_days": 3,
     "missing_critical_days": 4,
-    "stale_warning_cycles": 6,
-    "stale_critical_cycles": 10,
+    "stale_warning_cycles": 12,
+    "stale_critical_cycles": 20,
     "price_move_warning_pct": 15.0,
     "price_move_critical_pct": 40.0,
     "shrinkflation_capacity_drop_pct": 5.0,
@@ -78,14 +78,20 @@ def _missing_today(cur, today: date) -> list[dict]:
 
 
 def _price_moves(cur, today: date, top_n: int = 10) -> list[dict]:
-    """Today vs avg(last 7 days excluding today)."""
+    """Today vs avg(last 7 days excluding today).
+
+    Skips products with fewer than MIN_AVG_OBS prior obs in the 7-day window —
+    a single historical point is not a meaningful "average" and produces
+    noisy alerts on freshly-added SKUs.
+    """
+    MIN_AVG_OBS = 3
     cur.execute(
         """
         WITH today_obs AS (
           SELECT product_id, store, price_regular FROM inflation_observations WHERE obs_date = ?
         ),
         prev7 AS (
-          SELECT product_id, store, AVG(price_regular) AS avg7
+          SELECT product_id, store, AVG(price_regular) AS avg7, COUNT(*) AS n_obs
           FROM inflation_observations
           WHERE obs_date BETWEEN ? AND ?
           GROUP BY product_id, store
@@ -95,9 +101,9 @@ def _price_moves(cur, today: date, top_n: int = 10) -> list[dict]:
         FROM today_obs t
         JOIN prev7 ON prev7.product_id = t.product_id AND prev7.store = t.store
         JOIN inflation_products p ON p.product_id = t.product_id
-        WHERE prev7.avg7 > 0
+        WHERE prev7.avg7 > 0 AND prev7.n_obs >= ?
         """,
-        (today, today - timedelta(days=7), today - timedelta(days=1)),
+        (today, today - timedelta(days=7), today - timedelta(days=1), MIN_AVG_OBS),
     )
     moves = []
     for r in cur.fetchall():
