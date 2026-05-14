@@ -82,23 +82,58 @@ Brak — wszystko zacommitowane i wypushowane do origin.
 
 ## Aktywne wątki (stan 2026-04-24, do kontynuacji)
 
-### 🔥 Inflation Scraper — otwarta decyzja projektowa
-**Kontekst:** Potencjalnie najmocniejszy projekt w roadmapie (patrz Backlog niżej). Każdy rozumie inflację, natychmiastowy hook „GUS mówi X, mój koszyk mówi Y", double-use (własne finanse), zamyka klamrę z Gov Spending. **Time-critical**: time-series potrzebuje czasu, start 2026-04 → maj 2027 = 13 msc danych; start w Q4 2026 = słaby demo.
+### 🔥 Inflation Scraper — DECYZJE ZAMKNIĘTE (2026-04-30) → spec: `docs/INFLATION_BASKET_SPEC.md`
 
-**Ustalone (mocne):**
-- Start-targets: **Frisco + Carrefour Online + Ceneo + ceny.stat.gov.pl (GUS open data)**. ZERO Biedronka/Lidl na MVP (agresywny anty-bot + ToS violation).
-- ~40 hardcoded URLs, nie dynamiczne kategorie.
-- Primary key = **EAN/barcode**, URL secondary.
-- Schema musi mieć: `price_base`, `promo_active` (bool), `price_promo` (nullable), `package_size`, `unit_price_per_100g`, `store_location`.
-- Monitoring przez istniejący `scraper_monitor`.
-- Cadence: tygodniowy (niedziela rano).
+**Otwarte pytania zamknięte:**
+- Filozofia koszyka: **(B)** Inżynier — własne zakupy, equal-weight. Wagi GUS dopiero V2 (= ścieżka D rozłożona w czasie).
+- Sklepy: **Frisco + Auchan zakupy (Warszawa)**. Carrefour/Ceneo wycięte (2 wystarczą; research 2026-04-30 potwierdził feasibility tych dwóch).
+- N produktów: **40** (3-4 per kategoria GUS, threshold reprezentatywności).
+- Cadence: **3× tygodniowo** (pn/śr/pt 22:00) — nie codziennie, sustainability.
+- AI: **NIE w MVP**, V1 dopiero (klasyfikacja kategorii GUS + shrinkflation detection przez Gemini Flash-Lite).
+- Folder: `inflation_basket/`.
+- Start: **teraz** (po sesji 2026-04-30).
 
-**Otwarte pytanie (czekam na decyzję user):** filozofia koszyka
-- **(A)** GUS-aligned od dnia 1 — wagi kategorii CPI z publikacji GUS + własne mierzone ceny (stratified sampling). Hook: „mój CPI vs ichni CPI". Wymaga researchu upfront.
-- **(B)** „Koszyk Inżyniera" — 40 produktów własnych, equal-weight. Najszybszy start. Zalecany przez drugi LLM („Tech Lead") który skrytykował (A) jako pułapkę juniorską.
-- **(D)** Hybryda (rekomendacja Claude): start jak (B), ale schema od dnia 1 gotowy na ewolucję — po ~6msc mapujesz 40 produktów do kategorii GUS, wagi CPI dają DRUGĄ kolumnę indeksu. Koszt: 2h więcej myślenia nad schemą teraz. Efekt: trzy historie z jednego wysiłku (mój / mój-w-wagach-GUS / oficjalny GUS).
+**Harmonogram:** MVP 4 tyg. → V1 +4 tyg. → V2 po 6 mies. zbierania danych (= dual-index mój/GUS, public dashboard, LinkedIn launch).
 
-**Uzasadnienie odrzucenia krytyki TL:** TL twierdził że (A) = „udawanie GUS z 40 produktami = arbitralność". To niedoczytanie — (A) to stratified sampling z publicznymi wagami, standardowa metoda (Coface, mBank Research, IBS). Ale TL słusznie wskazał że (B) rusza szybciej — stąd synteza (D).
+**Sustainability gates** (z konstytucji mental state 2026-04-30): pauza po MVP/V1 dozwolona, stop-signs zdefiniowane w specu §11.
+
+**Status (2026-05-01, koniec sesji — pauza ~3h, /clear wykonany):**
+- ✅ Wybór produktów: **52 produktów** w `inflation_basket/seed/products.py`
+- ✅ Matching strategy: 29 same_sku + 23 logical_only (po korektach: Erytrytol/Sól → logical_only z brand=None)
+- ✅ Diversyfikacja dostawców: 24 marki, max 2 produkty per marka
+- ✅ Mini-koszyk importowany: 9 produktów (~17%) — Grana Padano IT, Mutti IT, Monini IT, Granoro IT, Kalamata GR, banany EC, awokado/cytryny ES, mango BR
+- ✅ `inflation_basket/db/schema.py` + `db/operations.py` (2-layer retry, MERGE)
+- ✅ Master catalog w Azure SQL — 4 tabele, **52 produkty po DELETE+re-seed**
+- ✅ `inflation_basket/url_mapper.py` (interactive manual fallback) + `auto_mapper.py` (algorithmic, scoring 40/30/30)
+- ✅ **Branch `feat/inflation-basket`** + commit `254cf4a` (11 files, +1633). Pracujemy na branchu, nie main.
+
+**Status update 2026-05-02 (sesja domykająca MVP):**
+- ✅ **100% pokrycie cross-store: 52/52 produktów × 2 sklepy = 104/104 active URLs**
+  (z 60% przed sesją — uzupełnione przez manualny mapping 29 URL + 12 korekt master catalog: brand/name/matching_type/capacity)
+- ✅ **`inflation_basket/scrape.py` — slug-based query dla Auchan** (URL slug → indexable terms; lepsze niż `name_canonical`). Naprawia 7/9 błędów z pierwszego runu.
+- ✅ **2026-05-02: 104 obserwacji w DB** (Frisco 52, Auchan 52, 0 errors). Idempotency MERGE potwierdzona — wczorajsze 75 obs (2026-05-01) nietknięte.
+- ✅ **Task Scheduler bundle gotowy** (struktura jak Pracuj, ale strict 3×/tydz pn/śr/pt 22:00 — bez LogonTrigger, żeby egzekwować sustainability gate ze spec'u):
+  - `inflation_basket/scrape_monitor.py` — wrapper z email alerts (próg 90%)
+  - `run_inflation_scrape.bat` — entry + log rotation 60 dni (`inflation_basket/logs/`)
+  - `scheduler_inflation_task.xml` — CalendarTrigger ScheduleByWeek pn/śr/pt 22:00 (`StartWhenAvailable=true` = missed run catch-up gdy laptop był wyłączony, BEZ duplikacji)
+  - `setup_inflation_scheduler.ps1` — idempotent register (potrzebuje admin)
+- ✅ **SMTP sanity OK** — Damian potwierdził `--test-email` działa (2026-05-02)
+- ✅ Commit `51ad501` na branchu `feat/inflation-basket`
+
+**🚧 GDZIE STANĘLIŚMY — następna sesja:**
+- ⏳ **Damian rejestruje Task** (admin PowerShell): `PowerShell -ExecutionPolicy Bypass -File setup_inflation_scheduler.ps1`. Pierwszy auto-run: poniedziałek 2026-05-04 22:00, potem śr 06, pt 08, pn 11, ...
+- ⏳ **Power BI minimal** — po 1-2 tyg danych (7-14 datapoints/produkt). Połącz z Azure SQL → `inflation_observations` → 1 line chart per produkt.
+- ⏳ **Merge `feat/inflation-basket` → main** — gdy MVP soak okaże stabilność (po 1-2 tyg auto-runs).
+- ⏳ (V1, +4 tyg) AI klasyfikacja kategorii GUS + shrinkflation detection (Gemini Flash-Lite).
+
+**Pierwsze cross-store data points (2026-05-01):**
+- Mleko Łaciate bez laktozy 1L: Frisco 6.09 / Auchan 5.88 (Auchan -3.5%)
+- Masło Łaciate 200g: Frisco 7.49 / Auchan 6.79 (Auchan -9.3%)
+- Cheddar Mlekovita 150g: Frisco 7.49 / Auchan 6.78 (Auchan -9.5%)
+- Twaróg Piątnica 250g: Frisco 6.09 / Auchan 6.69 (Auchan +9.9%)
+- Jogurt Bakoma: Frisco 4.49 / Auchan 4.48 (~0%)
+
+**Pełny handoff (komendy, prompt subagenta, mental state):** patrz `docs/SESSION_HANDOFF_2026-05-01.md` (sekcja Update v2 na końcu).
 
 ### LinkedIn — urodziny 2026-05-03 jako symboliczny start
 - Target pierwszego posta: **3 maja 2026** (41. urodziny, za 9 dni od 2026-04-24).

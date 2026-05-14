@@ -1,0 +1,39 @@
+--MISSING-BOTH--
+58|nabial|Ser Grana Padano kawałek|Galbani|same_sku
+60|mieso|Pierś z indyka|-|logical_only
+65|wedlina|Polędwica sopocka plastry|Krakus|same_sku
+68|owoce|Banany|-|logical_only
+73|warzywa|Pomidory świeże|-|logical_only
+84|przyprawy|Ziele angielskie|Galeo|same_sku
+89|napoje|Woda mineralna butelka|Muszynianka|same_sku
+96|konserwy|Oliwki Kalamata słoik|-|same_sku
+--MISSING-ONE--
+62|frisco|mieso|Antrykot wołowy|-|logical_only
+70|frisco|owoce|Awokado|-|logical_only
+72|frisco|owoce|Cytryny|-|logical_only
+75|frisco|warzywa|Ogórek zielony długi|-|logical_only
+77|auchan|warzywa|Rukola opakowanie|-|logical_only
+81|auchan|przyprawy|Sól himalajska mielona|-|logical_only
+83|frisco|przyprawy|Liść laurowy|Prymat|same_sku
+91|auchan|chemia|Proszek do prania kolor|Vizir|same_sku
+94|auchan|chemia|Papier toaletowy|Velvet|same_sku
+95|auchan|konserwy|Pomidory krojone Polpa puszka|Mutti|same_sku
+99|auchan|maki|Mąka żytnia typ 700|-|logical_only
+102|auchan|zboza|Ryż basmati|Britta|same_sku
+103|auchan|zboza|Makaron pełnoziarnisty penne|Granoro|same_sku
+--CATEGORY--
+chemia|5|3|2|0
+jajka|1|1|0|0
+konserwy|2|0|1|1
+maki|2|1|1|0
+mieso|6|4|1|1
+mrozonki|2|2|0|0
+nabial|7|6|0|1
+napoje|1|0|0|1
+owoce|5|2|2|1
+przyprawy|4|1|2|1
+slodycze|4|4|0|0
+tluszcze|1|1|0|0
+warzywa|7|4|2|1
+wedlina|3|2|0|1
+zboza|2|0|2|0

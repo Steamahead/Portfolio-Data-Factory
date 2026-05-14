@@ -44,3 +44,4 @@ energy_prophet/backfill_feb2026.py
 # Working files
 blog_articles.md
 *.tmp
+inflation_basket/seed/playwright_state/
