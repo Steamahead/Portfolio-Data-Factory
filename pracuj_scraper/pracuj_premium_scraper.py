@@ -1,11 +1,15 @@
 """
 Pracuj.pl Premium Scraper v3 - Portfolio Data Factory
 =====================================================
-Two-phase scraper: listing (headless) → detail (headed).
+Two-phase scraper: jeden Camoufox kontekst dla obydwu faz.
 
-Faza 1 (headless):  Listing pages → __NEXT_DATA__ → Top N URLs per kategoria.
-Faza 2 (headed):    Detail pages → __NEXT_DATA__ → pełne dane oferty.
-                    Headed mode omija Cloudflare Turnstile na stronach detalu.
+Faza 1: Listing pages → __NEXT_DATA__ → URLs per kategoria.
+Faza 2: Detail pages → __NEXT_DATA__ → pełne dane oferty.
+
+Camoufox = custom Firefox build z fingerprint patches na poziomie C++ —
+przechodzi CF Turnstile bez 2captcha. Pierwszy request w sesji = ~60s
+(CF auto-resolves), kolejne strony ~1-2s. cf_clearance cookie cache'owany
+w pracuj_scraper/.camoufox_profile/ i reused między fazami.
 
 Dane z detail page:
   - Salary osobno dla UoP i B2B
@@ -17,9 +21,9 @@ Kategorie (7):
   Non-IT:  Bankowość, Finanse/Ekonomia, Marketing
   IT:      Business Analytics, Data/BI, AI/ML, Project Management
 
-Wymaga: playwright, pandas
-  pip install playwright pandas
-  playwright install chromium
+Wymaga: camoufox, pandas, pyodbc
+  pip install camoufox pandas pyodbc
+  python -m camoufox fetch
 """
 
 import sys
@@ -34,7 +38,8 @@ from datetime import datetime
 
 import pandas as pd
 import pyodbc
-from playwright.sync_api import sync_playwright
+import browser_cookie3
+from camoufox.sync_api import Camoufox
 
 
 # --- Fix kodowania Windows ---
@@ -101,15 +106,26 @@ def get_output_path() -> str:
         print(f"  [!] {OUTPUT_CSV} zablokowany - zapisuję do {alt}")
         return alt
 
-BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+CF_ABORT_AFTER = 15   # abort FAZA 2 po tylu consecutive failures (safety; Camoufox stabilny)
 
-CF_WAIT_SECONDS = 7   # czas na rozwiązanie Cloudflare w headed mode (było 10)
-CF_RESTART_AFTER = 5  # restart browser po tylu consecutive failures
-CF_ABORT_AFTER = 15   # abort FAZA 2 po tylu consecutive failures (po 2 restartach)
+# --- Faza 1: retry per kategoria + warmup CF ---
+# CF Turnstile losowo blokuje kategorie ("Cierpliwości..."). Bez retry pojedynczy
+# blok = 0 ofert w tej kategorii. Z retry + warmup home page szansa wzrasta.
+CAT_RETRY_MAX = 2                     # ile razy ponów kategorię po pełnym 0
+CAT_RETRY_BACKOFF_S = 45              # sleep przed retry (CF cooldown)
+WARMUP_HOME_PAGES = [
+    "https://www.pracuj.pl/",
+    "https://it.pracuj.pl/",
+]
+WARMUP_SLEEP_S = 6                    # odczekaj po warmup, żeby CF resolved
+
+# --- Cookie hijack hybrid (2026-05-14) ---
+# Pracuj.pl wymaga manualnego CF Turnstile checkbox click przy starcie sesji
+# Camoufox. Workaround: czytamy cf_clearance z prawdziwego Firefoxa użytkownika
+# (gdzie user wszedł raz tygodniowo i kliknął checkbox) i wstrzykujemy do
+# Camoufox context. Idea: Camoufox + Firefox-cookies = CF widzi już rozwiązany
+# challenge i nie pyta o nowy click. Daily Task Scheduler działa bezobsługowo.
+# Chrome 127+ App-Bound Encryption blokuje hijack z Chrome → tylko Firefox/Edge.
 
 
 # --- Utility ---
@@ -122,6 +138,83 @@ def _extract_offer_id(url: str) -> str:
 
 def polite_delay(min_s: float = 2.0, max_s: float = 4.0):
     time.sleep(random.uniform(min_s, max_s))
+
+
+# Browser preference order for cf_clearance hijack — Firefox first, bo Chrome 127+
+# wprowadził App-Bound Encryption (browser_cookie3 nie potrafi odszyfrować).
+_BROWSER_LOADERS = [
+    ("firefox", lambda d: browser_cookie3.firefox(domain_name=d)),
+    ("chrome",  lambda d: browser_cookie3.chrome(domain_name=d)),
+    ("edge",    lambda d: browser_cookie3.edge(domain_name=d)),
+]
+
+
+def _load_cookies_from_browser(domain: str) -> tuple[list, str]:
+    """
+    Próbuje załadować cookies dla domeny z każdego browsera po kolei,
+    zwraca pierwszy który zawiera cf_clearance.
+
+    Zwraca (cookies_list, browser_name). cookies_list to lista obiektów
+    Cookie z browser_cookie3 (mają atrybuty .name .value .domain .path .expires .secure).
+    Pusta lista + "" gdy żaden browser nie ma cf_clearance.
+    """
+    fallback: tuple[list, str] = ([], "")
+    for name, loader in _BROWSER_LOADERS:
+        try:
+            cj = list(loader(domain))
+        except Exception as e:
+            print(f"  [cookies] {name} dla {domain}: {str(e)[:80]}")
+            continue
+        has_cf = any(c.name == "cf_clearance" for c in cj)
+        if has_cf:
+            print(f"  [cookies] {name} dla {domain}: cf_clearance OK ({len(cj)} cookies)")
+            return cj, name
+        elif cj and not fallback[0]:
+            fallback = (cj, name)
+    if fallback[0]:
+        print(f"  [cookies] {fallback[1]} dla {domain}: cookies obecne ale BRAK cf_clearance")
+    return fallback
+
+
+def _normalize_expires(raw) -> float:
+    """
+    Normalizuje expires do formatu Playwright: -1 (session) lub dodatnia liczba
+    sekund unix timestamp. Firefox zwraca milisekundy (np. 1810144258892) — dzielimy.
+    """
+    if raw is None or raw == 0:
+        return -1.0
+    if not isinstance(raw, (int, float)):
+        return -1.0
+    val = float(raw)
+    if val > 1e12:  # milisekundy → sekundy
+        val = val / 1000.0
+    if val <= 0:
+        return -1.0
+    return val
+
+
+def _cookies_to_playwright_format(cookies_list: list) -> list[dict]:
+    """
+    Konwertuje cookies z browser_cookie3 do formatu który przyjmuje Playwright
+    add_cookies(): {name, value, domain, path, expires, secure, sameSite}.
+    """
+    out = []
+    for c in cookies_list:
+        cookie = {
+            "name": c.name,
+            "value": c.value,
+            "domain": c.domain,
+            "path": c.path or "/",
+            "secure": bool(c.secure),
+            "httpOnly": bool(getattr(c, "_rest", {}).get("HttpOnly", False) or getattr(c, "httpOnly", False)),
+            "expires": _normalize_expires(c.expires),
+        }
+        # sameSite — Playwright wymaga "Strict" | "Lax" | "None"
+        same_site = (getattr(c, "_rest", {}) or {}).get("SameSite") or getattr(c, "sameSite", None)
+        if same_site and same_site.lower() in ("strict", "lax", "none"):
+            cookie["sameSite"] = same_site.capitalize()
+        out.append(cookie)
+    return out
 
 
 def load_known_offers() -> dict[str, str]:
@@ -190,112 +283,171 @@ def _build_page_url(base_url: str, page_num: int) -> str:
     return f"{base_url}{sep}pn={page_num}"
 
 
-def phase1_collect_urls(playwright) -> list[dict]:
+CAMOUFOX_PROFILE_DIR = SCRAPER_DIR / ".camoufox_profile"
+CF_RESOLVE_MAX_WAIT_S = 90  # cold start: pierwszy request w sesji rozwiązuje CF challenge
+
+
+def _parse_next_data(nd: dict, cat_total_hint) -> tuple[list, "str | int"]:
+    """Wyciąga groupedOffers z dehydrated state Next.js. Zwraca (offers, total)."""
+    queries = (
+        nd.get("props", {})
+        .get("pageProps", {})
+        .get("dehydratedState", {})
+        .get("queries", [])
+    )
+    for q in queries:
+        sd = q.get("state", {}).get("data", {})
+        if isinstance(sd, dict) and "groupedOffers" in sd:
+            total = sd.get("groupedOffersTotalCount", cat_total_hint)
+            return sd["groupedOffers"], total
+    return [], cat_total_hint
+
+
+def _warmup_cf(page) -> None:
     """
-    Otwiera listing pages każdej kategorii w headless mode.
-    Paginacja: iteruje po stronach (?pn=1,2,3...) aż groupedOffers == 0.
-    Nowy kontekst per stronę (wymóg Cloudflare).
+    Wejście na strony główne obu domen przed pętlą kategorii — żeby cf_clearance
+    osiadł dla każdej domeny i CF nie atakował 'Cierpliwości...' na pierwszej kategorii.
     """
-    print("\n[FAZA 1] Zbieranie URL-i z listing pages (headless, paginacja)...\n")
-    browser = playwright.chromium.launch(headless=True)
+    print("  [warmup] Przygotowuję cf_clearance dla obu domen...")
+    for home in WARMUP_HOME_PAGES:
+        try:
+            page.goto(home, wait_until="domcontentloaded", timeout=60000)
+            time.sleep(WARMUP_SLEEP_S)
+            print(f"    [warmup] {home} OK")
+        except Exception as e:
+            print(f"    [warmup] {home} BŁĄD: {e} (kontynuuję)")
+
+
+def _collect_one_category(page, cat_name: str, cat_url: str, seen_ids: set) -> tuple[list, "str | int"]:
+    """
+    Jedno podejście do kategorii. Zwraca (offers_for_this_cat, cat_total_z_serwera).
+    Pusta lista = CF zablokował (Cierpliwości...) lub strona zwróciła 0 ofert.
+    """
+    cat_stubs: list[dict] = []
+    cat_total: "str | int" = "?"
+
+    for page_num in range(1, MAX_PAGES + 1):
+        page_url = _build_page_url(cat_url, page_num)
+
+        try:
+            page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            print(f"    Str. {page_num}: goto BŁĄD: {e}")
+            break
+
+        deadline = time.time() + CF_RESOLVE_MAX_WAIT_S
+        while time.time() < deadline:
+            if page.locator("#__NEXT_DATA__").count() > 0:
+                break
+            time.sleep(1.0)
+
+        if page.locator("#__NEXT_DATA__").count() == 0:
+            title = page.title()
+            print(f"    Str. {page_num}: BRAK __NEXT_DATA__ (title='{title}') - przerywam")
+            break
+
+        try:
+            nd_text = page.locator("#__NEXT_DATA__").inner_text()
+            nd = json.loads(nd_text)
+        except Exception as e:
+            print(f"    Str. {page_num}: JSON parse error: {e}")
+            break
+
+        grouped_offers, cat_total = _parse_next_data(nd, cat_total)
+
+        if not grouped_offers:
+            print(f"    Str. {page_num}: 0 ofert - koniec kategorii")
+            break
+
+        page_count = 0
+        for offer in grouped_offers:
+            offers_list = offer.get("offers") or []
+            if not offers_list:
+                continue
+            url = offers_list[0].get("offerAbsoluteUri", "")
+            if not url:
+                continue
+            oid = _extract_offer_id(url) or url
+            if oid in seen_ids:
+                continue
+            seen_ids.add(oid)
+            cat_stubs.append({
+                "category": cat_name,
+                "url": url,
+                "offer_id": oid,
+                "title": offer.get("jobTitle", ""),
+                "company": offer.get("companyName", ""),
+            })
+            page_count += 1
+            if TOP_N and len(cat_stubs) >= TOP_N:
+                break
+
+        print(f"    Str. {page_num}: +{page_count} URL-i (łącznie kat.: {len(cat_stubs)})")
+
+        if TOP_N and len(cat_stubs) >= TOP_N:
+            break
+
+        polite_delay(1.5, 3.0)
+
+    return cat_stubs, cat_total
+
+
+def phase1_collect_urls(page) -> tuple[list[dict], dict[str, int]]:
+    """
+    Zbiera URL-e ofert przez Camoufox + Firefox cookies injection (hybryda).
+
+    Strategia stabilności:
+      - warmup home page obu domen przed pętlą kategorii
+      - shuffle kolejności kategorii (rotacja "pierwszego strzału")
+      - per-category retry (max CAT_RETRY_MAX) gdy podejście zwraca 0 ofert
+      - polite_delay (5-10s) między kategoriami
+
+    Zwraca:
+      stubs: lista wszystkich zebranych URL-i
+      cat_counts: ile URL-i zebrano per kategoria
+    """
+    print("\n[FAZA 1] Zbieranie URL-i (Camoufox)...\n")
+    _warmup_cf(page)
+
     stubs: list[dict] = []
     seen_ids: set[str] = set()
+    cat_counts: dict[str, int] = {cat: 0 for cat in CATEGORIES}
 
-    for cat_name, cat_url in CATEGORIES.items():
-        print(f"  [{cat_name}] {cat_url}")
-        cat_count = 0
-        cat_total = "?"
+    cats_shuffled = list(CATEGORIES.items())
+    random.shuffle(cats_shuffled)
+    print(f"  [order] {' → '.join(c for c, _ in cats_shuffled)}")
 
-        for page_num in range(1, MAX_PAGES + 1):
-            page_url = _build_page_url(cat_url, page_num)
+    for cat_idx, (cat_name, cat_url) in enumerate(cats_shuffled):
+        for attempt in range(1, CAT_RETRY_MAX + 2):
+            label = f"[{cat_name}]" if attempt == 1 else f"[{cat_name}] retry {attempt - 1}/{CAT_RETRY_MAX}"
+            print(f"\n  {label} {cat_url}")
 
-            ctx = browser.new_context(
-                user_agent=BROWSER_UA,
-                viewport={"width": 1920, "height": 1080},
-                locale="pl-PL",
-            )
-            page = ctx.new_page()
+            cat_stubs, cat_total = _collect_one_category(page, cat_name, cat_url, seen_ids)
 
-            try:
-                page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(3000)
-                handle_cookie_consent(page)
-                page.wait_for_timeout(2000)
-
-                nd = get_next_data(page)
-                if not nd:
-                    print(f"    Str. {page_num}: BRAK __NEXT_DATA__ - przerywam")
-                    ctx.close()
-                    break
-
-                queries = (
-                    nd.get("props", {})
-                    .get("pageProps", {})
-                    .get("dehydratedState", {})
-                    .get("queries", [])
-                )
-
-                grouped_offers = []
-                for q in queries:
-                    sd = q.get("state", {}).get("data", {})
-                    if isinstance(sd, dict) and "groupedOffers" in sd:
-                        grouped_offers = sd["groupedOffers"]
-                        if cat_total == "?":
-                            cat_total = sd.get("groupedOffersTotalCount", "?")
-                        break
-
-                if not grouped_offers:
-                    print(f"    Str. {page_num}: 0 ofert - koniec kategorii")
-                    ctx.close()
-                    break
-
-                page_count = 0
-                for offer in grouped_offers:
-                    offers_list = offer.get("offers") or []
-                    if not offers_list:
-                        continue
-                    url = offers_list[0].get("offerAbsoluteUri", "")
-                    if not url:
-                        continue
-                    oid = _extract_offer_id(url) or url
-                    if oid in seen_ids:
-                        continue
-                    seen_ids.add(oid)
-                    stubs.append({
-                        "category": cat_name,
-                        "url": url,
-                        "offer_id": oid,
-                        "title": offer.get("jobTitle", ""),
-                        "company": offer.get("companyName", ""),
-                    })
-                    page_count += 1
-                    cat_count += 1
-                    if TOP_N and cat_count >= TOP_N:
-                        break
-
-                print(f"    Str. {page_num}: +{page_count} URL-i (łącznie kat.: {cat_count})")
-
-                # Przerwij paginację jeśli osiągnięto TOP_N
-                if TOP_N and cat_count >= TOP_N:
-                    ctx.close()
-                    break
-
-            except Exception as e:
-                print(f"    Str. {page_num} BŁĄD: {e}")
-                ctx.close()
+            if cat_stubs:
+                stubs.extend(cat_stubs)
+                cat_counts[cat_name] = len(cat_stubs)
+                print(f"    SUMA [{cat_name}]: {len(cat_stubs)} ofert (serwer: {cat_total})")
                 break
-            finally:
+
+            if attempt <= CAT_RETRY_MAX:
+                print(f"    [retry] 0 ofert; sleep {CAT_RETRY_BACKOFF_S}s + warmup domeny...")
+                time.sleep(CAT_RETRY_BACKOFF_S)
+                domain_home = "https://it.pracuj.pl/" if "it.pracuj.pl" in cat_url else "https://www.pracuj.pl/"
                 try:
-                    ctx.close()
-                except Exception:
-                    pass
-                polite_delay(1.5, 3.0)
+                    page.goto(domain_home, wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(WARMUP_SLEEP_S)
+                except Exception as e:
+                    print(f"    [retry] warmup BŁĄD: {e}")
+            else:
+                print(f"    SUMA [{cat_name}]: 0 ofert (serwer: {cat_total}) — wyczerpane retry")
 
-        print(f"    SUMA [{cat_name}]: {cat_count} ofert (serwer: {cat_total})")
+        if cat_idx < len(cats_shuffled) - 1:
+            polite_delay(5.0, 10.0)
 
-    browser.close()
     print(f"\n  Łącznie URL-i do Deep Dive: {len(stubs)}")
-    return stubs
+    print(f"  Per kategoria: {cat_counts}")
+    return stubs, cat_counts
 
 
 # ===================================================================
@@ -445,46 +597,16 @@ def parse_detail_page(nd: dict, category: str, url: str) -> dict:
     }
 
 
-def _launch_headed_browser(playwright):
-    """Tworzy nowy headed browser + context + page."""
-    browser = playwright.chromium.launch(
-        headless=False,
-        args=["--disable-blink-features=AutomationControlled"],
-    )
-    ctx = browser.new_context(
-        user_agent=BROWSER_UA,
-        viewport={"width": 1920, "height": 1080},
-        locale="pl-PL",
-    )
-    page = ctx.new_page()
-    return browser, ctx, page
-
-
-def _restart_browser(playwright, browser, ctx):
-    """Zamyka stary browser i tworzy nowy (fresh Cloudflare fingerprint)."""
-    try:
-        ctx.close()
-    except Exception:
-        pass
-    try:
-        browser.close()
-    except Exception:
-        pass
-    time.sleep(5)
-    return _launch_headed_browser(playwright)
-
-
-def phase2_deep_dive(playwright, stubs: list[dict], progress_callback=None) -> list[dict]:
+def phase2_deep_dive(page, stubs: list[dict], progress_callback=None) -> list[dict]:
     """
-    Otwiera każdą ofertę w headed browser (Cloudflare bypass).
-    Wyciąga pełne dane z __NEXT_DATA__ detail page.
+    Wyciąga pełne dane z __NEXT_DATA__ detail page przez wspólny Camoufox page
+    (ta sama sesja co Faza 1, cf_clearance reused → strony detalu ładują się ~2s).
 
-    Circuit breaker: po CF_RESTART_AFTER consecutive failures restartuje browser.
-    Po CF_ABORT_AFTER consecutive failures przerywa FAZA 2 z częściowymi wynikami.
+    Circuit breaker: po CF_ABORT_AFTER consecutive failures przerywa z częściowymi
+    wynikami. Restart browsera nie potrzebny — Camoufox stabilny.
     """
-    print(f"\n[FAZA 2] Deep Dive - {len(stubs)} ofert (headed browser)...\n")
+    print(f"\n[FAZA 2] Deep Dive - {len(stubs)} ofert (Camoufox, ta sama sesja)...\n")
 
-    browser, ctx, page = _launch_headed_browser(playwright)
     all_rows: list[dict] = []
     consecutive_fails = 0
 
@@ -497,15 +619,17 @@ def phase2_deep_dive(playwright, stubs: list[dict], progress_callback=None) -> l
         if progress_callback:
             progress_callback(idx, len(stubs), "details")
 
-        page_ok = False
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-            # Czekamy na Cloudflare Turnstile
-            time.sleep(CF_WAIT_SECONDS)
+            # Polling __NEXT_DATA__ — z reused cf_clearance powinno być ~1-2s
+            deadline = time.time() + CF_RESOLVE_MAX_WAIT_S
+            while time.time() < deadline:
+                if page.locator("#__NEXT_DATA__").count() > 0:
+                    break
+                time.sleep(0.5)
 
             handle_cookie_consent(page)
-            time.sleep(1)
 
             nd = get_next_data(page)
             if not nd:
@@ -519,18 +643,17 @@ def phase2_deep_dive(playwright, stubs: list[dict], progress_callback=None) -> l
                     "Url": url,
                     "Scraped_At": datetime.now().isoformat(),
                 })
-                # "Ups..." = Cloudflare block — liczymy jako failure
-                if "ups" in (title or "").lower():
-                    consecutive_fails += 1
-                else:
-                    consecutive_fails = 0
-                    page_ok = True
+                consecutive_fails += 1
+                if consecutive_fails >= CF_ABORT_AFTER:
+                    remaining = len(stubs) - idx
+                    print(f"\n    [circuit-breaker] ABORT: {consecutive_fails} consecutive failures, "
+                          f"pomijam {remaining} pozostałych ofert.")
+                    break
                 continue
 
             row = parse_detail_page(nd, cat, url)
             all_rows.append(row)
             consecutive_fails = 0
-            page_ok = True
 
             print(f"    Tytuł:     {row['Job_Title']}")
             print(f"    Firma:     {row['Company']}")
@@ -553,35 +676,14 @@ def phase2_deep_dive(playwright, stubs: list[dict], progress_callback=None) -> l
                 "Scraped_At": datetime.now().isoformat(),
             })
             consecutive_fails += 1
-
-            # Auto-recovery: jeśli browser/page padł, restartuj
-            if "closed" in err_msg.lower() or "crash" in err_msg.lower():
-                print("    [recovery] Browser crash — restartuję...")
-                browser, ctx, page = _restart_browser(playwright, browser, ctx)
-                consecutive_fails = 0
-                print("    [recovery] Przeglądarka gotowa")
-
-        # --- Circuit breaker: Cloudflare blokuje sesję ---
-        if consecutive_fails > 0 and consecutive_fails % CF_RESTART_AFTER == 0:
-            print(f"\n    [circuit-breaker] {consecutive_fails} consecutive failures "
-                  f"— restartuję browser (nowa sesja)...")
-            browser, ctx, page = _restart_browser(playwright, browser, ctx)
-            print(f"    [circuit-breaker] Nowy browser gotowy\n")
-
-        if consecutive_fails >= CF_ABORT_AFTER:
-            remaining = len(stubs) - idx
-            print(f"\n    [circuit-breaker] ABORT: {consecutive_fails} consecutive failures, "
-                  f"pomijam {remaining} pozostałych ofert.")
-            print(f"    Zebrano {len(all_rows)} ofert (częściowe wyniki).\n")
-            break
+            if consecutive_fails >= CF_ABORT_AFTER:
+                remaining = len(stubs) - idx
+                print(f"\n    [circuit-breaker] ABORT: {consecutive_fails} consecutive failures, "
+                      f"pomijam {remaining} pozostałych ofert.")
+                break
 
         polite_delay(2.0, 4.0)
 
-    try:
-        ctx.close()
-        browser.close()
-    except Exception:
-        pass
     return all_rows
 
 
@@ -794,6 +896,7 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
         "sql_uploaded": 0,
         "categories_ok": [],
         "categories_empty": [],
+        "cat_counts": {},
         "errors": [],
         "output_path": None,
         "timestamp": datetime.now().isoformat(),
@@ -810,9 +913,40 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
     print("=" * 70)
 
     try:
-        with sync_playwright() as p:
-            # FAZA 1 — listing (szybkie, headless)
-            stubs = phase1_collect_urls(p)
+        # --- Cookie hijack hybrid: load Firefox cookies before Camoufox launch ---
+        # Pomysł: prawdziwy Firefox usera (gdzie kliknął CF checkbox) ma cf_clearance.
+        # Wstrzykujemy je do Camoufox context — CF widzi rozwiązany challenge i nie pyta.
+        ff_cookies_www, src_www = _load_cookies_from_browser(".pracuj.pl")
+        ff_cookies_it, src_it = _load_cookies_from_browser(".it.pracuj.pl")
+        all_ff_cookies = ff_cookies_www + ff_cookies_it
+        if all_ff_cookies:
+            print(f"  [hijack] Załadowano {len(all_ff_cookies)} cookies (źródła: {src_www or '-'}, {src_it or '-'})")
+        else:
+            print("  [hijack] BRAK cookies z przeglądarki — Camoufox poprosi o ręczny CF click.")
+
+        # Pojedynczy Camoufox kontekst dla OBYDWU faz — cf_clearance reused.
+        with Camoufox(
+            headless=False,
+            humanize=True,
+            locale="pl-PL",
+            os="windows",
+            persistent_context=True,
+            user_data_dir=str(CAMOUFOX_PROFILE_DIR),
+        ) as browser:
+            page = browser.new_page()
+
+            # Wstrzyknij cookies z prawdziwej przeglądarki — przed pierwszym goto.
+            if all_ff_cookies:
+                pw_cookies = _cookies_to_playwright_format(all_ff_cookies)
+                try:
+                    page.context.add_cookies(pw_cookies)
+                    print(f"  [hijack] Wstrzyknięto {len(pw_cookies)} cookies do Camoufox context")
+                except Exception as e:
+                    print(f"  [hijack] add_cookies BŁĄD: {e} (kontynuuję bez injection)")
+
+            # FAZA 1 — listing
+            stubs, cat_counts = phase1_collect_urls(page)
+            result["cat_counts"] = cat_counts
             if not stubs:
                 result["errors"].append("Faza 1: nie zebrano żadnych URL-i")
                 print("\n[FAIL] Nie zebrano żadnych URL-i.")
@@ -844,15 +978,18 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
                 result["success"] = True
                 result["new_offers"] = 0
                 for cat in CATEGORIES:
-                    result["categories_ok"].append(cat)
+                    if cat_counts.get(cat, 0) > 0:
+                        result["categories_ok"].append(cat)
+                    else:
+                        result["categories_empty"].append(cat)
                 save_known_offers(known_offers)
                 return result
 
             if progress_callback:
                 progress_callback(0, len(stubs), "listings_done")
 
-            # FAZA 2 — tylko nowe oferty (wolne, headed)
-            all_rows = phase2_deep_dive(p, stubs, progress_callback=progress_callback)
+            # FAZA 2 — tylko nowe oferty (ta sama Camoufox sesja → cf_clearance aktywny)
+            all_rows = phase2_deep_dive(page, stubs, progress_callback=progress_callback)
     except Exception as e:
         result["errors"].append(f"Krytyczny wyjątek: {e}")
         print(f"\n[FAIL] Krytyczny wyjątek: {e}")
@@ -902,9 +1039,13 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
         save_known_offers(known_offers)
         print(f"  Cache zapisano: {KNOWN_OFFERS_FILE.name} ({len(known_offers)} ofert)")
 
-    # --- Statystyki per kategoria (na podstawie listing, nie detail) ---
+    # --- Statystyki per kategoria (na bazie listing Faza 1) ---
+    cat_counts_local = result.get("cat_counts") or {}
     for cat in CATEGORIES:
-        result["categories_ok"].append(cat)
+        if cat_counts_local.get(cat, 0) > 0:
+            result["categories_ok"].append(cat)
+        else:
+            result["categories_empty"].append(cat)
 
     # Sprawdź oferty bez Job_Title (oznaka złamania parsera)
     if not df.empty and "Job_Title" in df.columns:
@@ -913,6 +1054,13 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
             result["errors"].append(
                 f"{len(empty_titles)} ofert bez Job_Title (możliwa zmiana struktury strony)"
             )
+
+    # ≥3 puste kategorie = CF Turnstile zablokował większość → traktuj jako fail
+    if len(result["categories_empty"]) >= 3:
+        result["errors"].append(
+            f"Faza 1: {len(result['categories_empty'])}/{len(CATEGORIES)} kategorii pustych "
+            f"({', '.join(result['categories_empty'])}) — CF Turnstile zablokował listing"
+        )
 
     result["success"] = len(result["errors"]) == 0 and result["total_offers"] > 0
 
