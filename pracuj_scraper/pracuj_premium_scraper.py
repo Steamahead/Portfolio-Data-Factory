@@ -913,6 +913,20 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
     print("=" * 70)
 
     try:
+        # --- Defensive: usuń stale lock files z poprzedniej sesji ---
+        # Bez tego `launch_persistent_context` wisi 180s i timeoutuje gdy Camoufox
+        # nie zamknął się czysto (Task Scheduler kill, crash, OS reboot during run).
+        # Empirycznie 2026-05-16: daily run o 22:33 padł właśnie na tym timeoucie
+        # bo .camoufox_profile/parent.lock zostało po wcześniejszej sesji.
+        # Zachowujemy cookies.sqlite i resztę profilu (cf_clearance reused).
+        lock_file = CAMOUFOX_PROFILE_DIR / "parent.lock"
+        if lock_file.exists():
+            try:
+                lock_file.unlink()
+                print(f"  [cleanup] Usunięto stale {lock_file.name}")
+            except Exception as e:
+                print(f"  [cleanup] Nie udało się usunąć {lock_file.name}: {e}")
+
         # --- Cookie hijack hybrid: load Firefox cookies before Camoufox launch ---
         # Pomysł: prawdziwy Firefox usera (gdzie kliknął CF checkbox) ma cf_clearance.
         # Wstrzykujemy je do Camoufox context — CF widzi rozwiązany challenge i nie pyta.
