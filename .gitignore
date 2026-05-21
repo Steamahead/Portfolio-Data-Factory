@@ -45,3 +45,12 @@ energy_prophet/backfill_feb2026.py
 blog_articles.md
 *.tmp
 inflation_basket/seed/playwright_state/
+
+# --- BROWSER PROFILES (local cookie/session state, do not commit) ---
+pracuj_scraper/.camoufox_profile/
+pracuj_scraper/.chrome_profile/
+
+# --- LOCAL SCRATCH / WINDOWS ARTIFACTS ---
+nul
+inflation_basket/read.txt
+inflation_basket/readme.txt
