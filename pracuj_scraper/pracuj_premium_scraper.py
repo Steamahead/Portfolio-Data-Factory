@@ -31,6 +31,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import time
 import random
 from pathlib import Path
@@ -913,19 +914,50 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
     print("=" * 70)
 
     try:
-        # --- Defensive: usuń stale lock files z poprzedniej sesji ---
-        # Bez tego `launch_persistent_context` wisi 180s i timeoutuje gdy Camoufox
-        # nie zamknął się czysto (Task Scheduler kill, crash, OS reboot during run).
-        # Empirycznie 2026-05-16: daily run o 22:33 padł właśnie na tym timeoucie
-        # bo .camoufox_profile/parent.lock zostało po wcześniejszej sesji.
-        # Zachowujemy cookies.sqlite i resztę profilu (cf_clearance reused).
-        lock_file = CAMOUFOX_PROFILE_DIR / "parent.lock"
-        if lock_file.exists():
+        # --- Defensive: zabij zombie camoufox.exe + usuń stale lock/recovery files ---
+        # Bez tego `launch_persistent_context` wisi 180s lub failuje natychmiast
+        # (exitCode=0 zaraz po starcie) gdy Camoufox nie zamknął się czysto.
+        # Empirycznie 2026-05-16: parent.lock zostawiony po crashu wieszał kolejny launch.
+        # Empirycznie 2026-05-22: 10 zombie camoufox.exe trzymało parent.lock, więc
+        # samo `unlink()` rzucało WinError 32 i scraper padał. Camoufox padł też
+        # w środku własnego startupu zostawiając .startup-incomplete + sessionstore
+        # recovery — następny start próbował crash-recovery i też się zwiesił.
+        # Zachowujemy cookies.sqlite i resztę profilu (cf_clearance reused) —
+        # czyścimy tylko procesy zombie + markery niedokończonej sesji.
+        if sys.platform == "win32":
             try:
-                lock_file.unlink()
-                print(f"  [cleanup] Usunięto stale {lock_file.name}")
+                kill = subprocess.run(
+                    ["taskkill", "/F", "/IM", "camoufox.exe"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                if kill.returncode == 0:
+                    print(f"  [cleanup] Zabito zombie camoufox.exe (taskkill OK)")
             except Exception as e:
-                print(f"  [cleanup] Nie udało się usunąć {lock_file.name}: {e}")
+                print(f"  [cleanup] taskkill camoufox.exe BŁĄD: {e}")
+        stale_files = [
+            CAMOUFOX_PROFILE_DIR / "parent.lock",
+            CAMOUFOX_PROFILE_DIR / ".startup-incomplete",
+            CAMOUFOX_PROFILE_DIR / "sessionCheckpoints.json",
+            CAMOUFOX_PROFILE_DIR / "cookies.sqlite-shm",
+            CAMOUFOX_PROFILE_DIR / "cookies.sqlite-wal",
+            CAMOUFOX_PROFILE_DIR / "places.sqlite-shm",
+            CAMOUFOX_PROFILE_DIR / "places.sqlite-wal",
+            CAMOUFOX_PROFILE_DIR / "favicons.sqlite-shm",
+            CAMOUFOX_PROFILE_DIR / "favicons.sqlite-wal",
+            CAMOUFOX_PROFILE_DIR / "sessionstore-backups" / "recovery.jsonlz4",
+            CAMOUFOX_PROFILE_DIR / "sessionstore-backups" / "recovery.baklz4",
+            CAMOUFOX_PROFILE_DIR / "sessionstore-backups" / "previous.jsonlz4",
+        ]
+        removed = []
+        for f in stale_files:
+            if f.exists():
+                try:
+                    f.unlink()
+                    removed.append(f.name)
+                except Exception as e:
+                    print(f"  [cleanup] Nie udało się usunąć {f.name}: {e}")
+        if removed:
+            print(f"  [cleanup] Usunięto stale: {', '.join(removed)}")
 
         # --- Cookie hijack hybrid: load Firefox cookies before Camoufox launch ---
         # Pomysł: prawdziwy Firefox usera (gdzie kliknął CF checkbox) ma cf_clearance.
