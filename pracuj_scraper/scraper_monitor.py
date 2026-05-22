@@ -521,6 +521,39 @@ SCRAPER_CONFIGS = {
 }
 
 
+def _kill_zombie_browsers(scraper_name: str) -> None:
+    """
+    Post-run cleanup: zabija sieroty browser-procesów po scraperze.
+
+    Empirycznie 2026-05-22: Task Scheduler kill po timeoucie NIE propaguje do
+    procesów potomnych. Po kilku awariach uzbierało się 10 zombie camoufox.exe,
+    które trzymały parent.lock w profilu i blokowały kolejne launche
+    (WinError 32 → exitCode=0 natychmiast po starcie).
+    Pre-launch cleanup w pracuj_premium_scraper.py też to robi (commit 6bbd642),
+    ale lepiej sprzątać po sobie zamiast polegać że następny run się obudzi.
+    """
+    if sys.platform != "win32":
+        return
+    # Mapowanie: scraper → lista nazw procesów do zabicia.
+    process_map = {
+        "Pracuj.pl": ["camoufox.exe"],
+    }
+    targets = process_map.get(scraper_name)
+    if not targets:
+        return
+    for proc_name in targets:
+        try:
+            res = subprocess.run(
+                ["taskkill", "/F", "/IM", proc_name],
+                capture_output=True, text=True, timeout=15,
+            )
+            # taskkill returncode 0 = zabito, 128 = brak procesów (oba OK)
+            if res.returncode == 0:
+                print(f"  [MONITOR] Post-run cleanup: zabito zombie {proc_name}", flush=True)
+        except Exception as e:
+            print(f"  [MONITOR] Post-run taskkill {proc_name} BŁĄD: {e}", flush=True)
+
+
 def _run_scraper_subprocess(scraper_name: str) -> dict:
     """
     Uruchamia scraper jako osobny proces (fault isolation).
@@ -573,6 +606,10 @@ def _run_scraper_subprocess(scraper_name: str) -> dict:
     except Exception as e:
         print(f"\n[MONITOR] Błąd uruchamiania {scraper_name}: {e}", flush=True)
         fail_result["errors"].append(f"Błąd subprocess: {e}")
+
+    # Post-run: zabij sieroty browser-procesów (Camoufox dla Pracuj).
+    # Bez tego zbierają się zombie przez wiele runów — patrz commit 6bbd642.
+    _kill_zombie_browsers(scraper_name)
 
     # Odczytaj wynik z pliku tymczasowego
     result = None
