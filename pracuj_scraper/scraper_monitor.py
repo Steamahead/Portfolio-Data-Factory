@@ -419,6 +419,8 @@ def build_daily_report_html(results: dict, history: list[dict]) -> str:
 
     rows = ""
     total_all = 0
+    total_new = 0  # suma netto delt vs poprzedni dzień (tylko portale z baseline)
+    total_new_has_baseline = False
     for name, r, source in all_scraper_rows:
         if source == "missing":
             rows += f"""
@@ -445,17 +447,21 @@ def build_daily_report_html(results: dict, history: list[dict]) -> str:
             run_ts = r.get("timestamp", "?")[:16].replace("T", " ")
             source_label = f' <span style="color:#888;font-size:11px;">(run z {run_ts})</span>'
 
-        # Porównanie z poprzednim runem
-        last = get_last_successful_run(
-            [h for h in history if h.get("scraper") == name and h.get("timestamp") != r.get("timestamp")],
-            name
-        )
+        # Porównanie z poprzednim DNIEM (ostatni udany run sprzed dzisiaj —
+        # pomija dzisiejsze retry, więc baseline = "poprzedni dzień z danymi").
+        prev_day_history = [
+            h for h in history
+            if h.get("scraper") == name and (h.get("timestamp", "")[:10] < today_date)
+        ]
+        last = get_last_successful_run(prev_day_history, name)
         if last and last.get("total_offers", 0) > 0:
             prev = last["total_offers"]
             diff = total - prev
+            total_new += diff
+            total_new_has_baseline = True
             diff_str = f"+{diff}" if diff >= 0 else str(diff)
             diff_color = "#28a745" if diff >= 0 else "#dc3545"
-            trend = f' <span style="color:{diff_color};font-size:12px;">({diff_str} vs poprzedni)</span>'
+            trend = f' <span style="color:{diff_color};font-size:12px;">({diff_str} netto vs poprzedni dzień)</span>'
         else:
             trend = ""
 
@@ -474,6 +480,14 @@ def build_daily_report_html(results: dict, history: list[dict]) -> str:
         {error_row}
         """
 
+    # Łączna delta netto vs poprzedni dzień (suma per-portal delt z baseline)
+    if total_new_has_baseline:
+        tn_str = f"+{total_new}" if total_new >= 0 else str(total_new)
+        tn_color = "#28a745" if total_new >= 0 else "#dc3545"
+        total_trend = f' <span style="color:{tn_color};font-size:13px;">({tn_str} netto vs poprzedni dzień)</span>'
+    else:
+        total_trend = ""
+
     html = f"""
     <html><body style="font-family:Segoe UI,Arial,sans-serif;max-width:600px;color:#333;">
     <h2 style="color:{status_color};">{status_icon} Daily Report — {ts}</h2>
@@ -483,7 +497,7 @@ def build_daily_report_html(results: dict, history: list[dict]) -> str:
       {rows}
       <tr style="border-top:2px solid #ccc;background:#fff;">
         <td style="padding:8px;font-weight:bold;">ŁĄCZNIE</td>
-        <td style="padding:8px;font-weight:bold;">{total_all} ofert</td>
+        <td style="padding:8px;font-weight:bold;">{total_all} ofert{total_trend}</td>
       </tr>
     </table>
 
