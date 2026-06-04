@@ -128,6 +128,16 @@ WARMUP_SLEEP_S = 6                    # odczekaj po warmup, żeby CF resolved
 # challenge i nie pyta o nowy click. Daily Task Scheduler działa bezobsługowo.
 # Chrome 127+ App-Bound Encryption blokuje hijack z Chrome → tylko Firefox/Edge.
 
+# --- Headless mode (2026-06-04) ---
+# Bug: Daily Task Scheduler odpala scraper o 20:00; gdy ekran zablokowany / wyświetlacz
+# uśpiony (Modern Standby), headful Camoufox wiesza się na tworzeniu okna — log kończy się
+# na "Installed 1 addon(s)", a launch_persistent_context failuje po 180s timeout. Empirycznie
+# 2026-06-04: ręczny run (pulpit aktywny) działa w <10s, scheduled run (locked screen) → 0 ofert.
+# Headless NIE zależy od pulpitu i przechodzi CF z injekcją cookies (zweryfikowane: www+it,
+# nextdata_hits=51, cf=OK). Dlatego default = headless. Escape hatch dla ręcznego debugu /
+# ręcznego kliknięcia CF gdy cookies wygasną: PRACUJ_HEADFUL=1 → headful.
+HEADLESS = os.environ.get("PRACUJ_HEADFUL", "").strip().lower() not in ("1", "true", "yes")
+
 
 # --- Utility ---
 
@@ -905,8 +915,8 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
 
     print("=" * 70)
     print("  Pracuj.pl  Premium Scraper v4  -  Portfolio Data Factory")
-    print("  Faza 1: Listing (headless) → URL-e")
-    print("  Faza 2: Detail  (headed)   → pełne dane (TYLKO NOWE)")
+    print(f"  Faza 1: Listing → URL-e   (Camoufox {'headless' if HEADLESS else 'headful'})")
+    print("  Faza 2: Detail  → pełne dane (TYLKO NOWE, ta sama sesja)")
     print(f"  Data:       {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"  Kategorie:  {len(CATEGORIES)} ({', '.join(CATEGORIES.keys())})")
     print(f"  Tryb:       {'PELNY (--full)' if full_mode else 'INKREMENTALNY'}")
@@ -972,7 +982,7 @@ def run(progress_callback=None, full_mode: bool = False) -> dict:
 
         # Pojedynczy Camoufox kontekst dla OBYDWU faz — cf_clearance reused.
         with Camoufox(
-            headless=False,
+            headless=HEADLESS,
             humanize=True,
             locale="pl-PL",
             os="windows",
