@@ -41,6 +41,8 @@ import sys
 import json
 import smtplib
 import argparse
+import atexit
+import ctypes
 import subprocess
 import tempfile
 import traceback
@@ -795,6 +797,47 @@ def watch_status(interval: int = 5):
         print("\nZatrzymano watch.")
 
 
+# --- Keep-awake guard (Windows Modern Standby) ---
+# Incydent 2026-06-05: scheduled run padł, bo laptop wszedł w Modern Standby
+# w trakcie Pracuj (Playwright, ~16 min). Cały tree procesów został zabity
+# (exit 0xC000013A = STATUS_CONTROL_C_EXIT) — NFJ/JustJoin (API, krótkie) zdążyły,
+# Pracuj nie. To ten sam wróg co incydent 2026-05-30 (bateria/Modern Standby).
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_AWAYMODE_REQUIRED = 0x00000040
+
+
+def _allow_sleep():
+    """Zwalnia keep-awake request (system znów może się uśpić normalnie)."""
+    if sys.platform == "win32":
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+
+
+def _prevent_sleep():
+    """Trzyma system w stanie roboczym na czas całego runu (tylko Windows).
+
+    SetThreadExecutionState z ES_CONTINUOUS blokuje przejście w idle sleep /
+    Modern Standby dopóki proces żyje. Request gaśnie automatycznie gdy proces
+    kończy działanie (atexit przy normalnym końcu, OS przy crashu) — żadnej
+    trwałej zmiany w ustawieniach zasilania laptopa.
+    """
+    if sys.platform != "win32":
+        return
+    flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
+    prev = ctypes.windll.kernel32.SetThreadExecutionState(flags)
+    if prev == 0:  # AWAYMODE bywa odrzucany na części maszyn — spróbuj bez niego
+        prev = ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        )
+    if prev == 0:
+        print("  [keep-awake] OSTRZEŻENIE: SetThreadExecutionState zwrócił 0 — "
+              "system może uśpić scraper w trakcie runu.", flush=True)
+    else:
+        print("  [keep-awake] System utrzymany w stanie roboczym na czas runu "
+              "(blokada Modern Standby).", flush=True)
+        atexit.register(_allow_sleep)
+
+
 def main():
     load_env()
 
@@ -818,6 +861,10 @@ def main():
         else:
             show_status()
         return
+
+    # --- Keep-awake: nie pozwól Windows uśpić maszyny w trakcie runu ---
+    # Bez tego scheduled run pada na Modern Standby (incydent 2026-06-05).
+    _prevent_sleep()
 
     # Determine which scrapers to run
     run_all = not (args.pracuj_only or args.nfj_only or args.justjoin_only)
