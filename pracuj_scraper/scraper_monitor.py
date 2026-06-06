@@ -72,6 +72,11 @@ MIN_OFFERS_PER_CATEGORY = 1   # minimum ofert per kategoria
 # Scrapery wymagane w każdym daily run - brak któregoś → ostrzeżenie w raporcie
 EXPECTED_SCRAPERS = ["NoFluffJobs", "JustJoin.it", "Pracuj.pl"]
 
+# Najwcześniejsza godzina, o której pełny daily run może wystartować.
+# Trigger SessionUnlock potrafi wystrzelić rano (gdy siadasz do pracy) — bramka
+# wieczorna pilnuje, żeby ~20-min scrapowanie nie ruszało wtedy. --force omija.
+DAILY_RUN_EARLIEST_HOUR = 19
+
 # Progress file — aktualizowany na bieżąco, odczytywany przez --status
 PROGRESS_FILE = SCRAPER_DIR / "scraper_progress.json"
 
@@ -872,7 +877,8 @@ def main():
     # może wystrzelić wiele razy dziennie. Bez tego strażnika każde odblokowanie
     # = pełny re-scrape (~20 min, niepotrzebny). --force omija strażnik.
     if run_all and not args.dry_run and not args.force:
-        today = datetime.now().strftime("%Y-%m-%d")
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
         done_today = {
             h["scraper"] for h in load_history()
             if (h.get("timestamp", "") or "").startswith(today) and h.get("success")
@@ -880,6 +886,11 @@ def main():
         if all(s in done_today for s in EXPECTED_SCRAPERS):
             print(f"  [skip] Wszystkie scrapery już dziś udane ({today}) — pomijam run "
                   f"(użyj --force, by wymusić).")
+            return
+        # Bramka wieczorna: unlock rano nie ma odpalać 20-min scrapowania.
+        if now.hour < DAILY_RUN_EARLIEST_HOUR:
+            print(f"  [skip] Za wcześnie ({now.strftime('%H:%M')}) — daily run rusza od "
+                  f"{DAILY_RUN_EARLIEST_HOUR}:00 (użyj --force, by wymusić teraz).")
             return
 
     # --- Keep-awake: nie pozwól Windows uśpić maszyny w trakcie runu ---
