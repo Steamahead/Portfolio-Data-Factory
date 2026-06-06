@@ -849,6 +849,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Bez wysyłania emaila")
     parser.add_argument("--status", action="store_true", help="Pokaż status aktywnego runu")
     parser.add_argument("--watch", action="store_true", help="Auto-odświeżanie statusu co 5s (z --status)")
+    parser.add_argument("--force", action="store_true",
+                        help="Wymuś pełny run nawet jeśli wszystkie scrapery już dziś się udały")
     args = parser.parse_args()
 
     if args.test_email:
@@ -862,12 +864,27 @@ def main():
             show_status()
         return
 
+    # Determine which scrapers to run
+    run_all = not (args.pracuj_only or args.nfj_only or args.justjoin_only)
+
+    # --- Idempotencja: pomiń, jeśli wszystkie scrapery JUŻ DZIŚ się udały ---
+    # Catch-up odpala się przy odblokowaniu ekranu (trigger SessionUnlock), więc
+    # może wystrzelić wiele razy dziennie. Bez tego strażnika każde odblokowanie
+    # = pełny re-scrape (~20 min, niepotrzebny). --force omija strażnik.
+    if run_all and not args.dry_run and not args.force:
+        today = datetime.now().strftime("%Y-%m-%d")
+        done_today = {
+            h["scraper"] for h in load_history()
+            if (h.get("timestamp", "") or "").startswith(today) and h.get("success")
+        }
+        if all(s in done_today for s in EXPECTED_SCRAPERS):
+            print(f"  [skip] Wszystkie scrapery już dziś udane ({today}) — pomijam run "
+                  f"(użyj --force, by wymusić).")
+            return
+
     # --- Keep-awake: nie pozwól Windows uśpić maszyny w trakcie runu ---
     # Bez tego scheduled run pada na Modern Standby (incydent 2026-06-05).
     _prevent_sleep()
-
-    # Determine which scrapers to run
-    run_all = not (args.pracuj_only or args.nfj_only or args.justjoin_only)
 
     # Lista scraperów do uruchomienia (na potrzeby emaila START)
     scrapers_planned = []
