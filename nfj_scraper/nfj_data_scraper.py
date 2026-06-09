@@ -117,6 +117,31 @@ def save_master(df: pd.DataFrame) -> None:
 # STAGE 1: LISTINGS (Search API with withSalaryMatch)
 # ============================================================
 
+def _request_with_retry(method: str, url: str, *, max_retries: int = 4,
+                        backoff_base: float = 2.0, **kwargs):
+    """HTTP request z retry na PRZEJŚCIOWE błędy sieciowe (ConnectionReset/10054,
+    RemoteDisconnected, timeouty). nofluffjobs.com sporadycznie zrywa połączenie
+    (awarie 06-03/06-07/06-09) — bez retry jeden taki blip wywalał cały scraper.
+    Błędy HTTP 4xx/5xx NIE są retry'owane (zachowujemy dotychczasowe zachowanie)."""
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError) as e:
+            last_exc = e
+            if attempt >= max_retries:
+                raise
+            wait = backoff_base ** attempt + random.uniform(0, 1)
+            print(f"\n  [retry] błąd sieci ({type(e).__name__}), próba "
+                  f"{attempt}/{max_retries}, czekam {wait:.1f}s...", flush=True)
+            time.sleep(wait)
+    raise last_exc  # nieosiągalne, asekuracyjnie
+
+
 def fetch_category(category: str) -> list[dict]:
     """Fetch all pages for one search category with withSalaryMatch=true.
 
@@ -132,14 +157,14 @@ def fetch_category(category: str) -> list[dict]:
                 "withSalaryMatch": ["true"],
             },
         }
-        resp = requests.post(
+        resp = _request_with_retry(
+            "POST",
             API_SEARCH_URL,
             params={"salaryCurrency": "PLN", "salaryPeriod": "month", "page": page},
             json=payload,
             headers=HEADERS,
             timeout=30,
         )
-        resp.raise_for_status()
         data = resp.json()
         postings = data.get("postings", [])
         total_pages = data.get("totalPages", 1)
