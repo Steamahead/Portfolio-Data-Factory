@@ -45,10 +45,11 @@ import atexit
 import ctypes
 import subprocess
 import tempfile
+import time
 import traceback
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # --- Fix kodowania Windows ---
@@ -575,6 +576,24 @@ def _kill_zombie_browsers(scraper_name: str) -> None:
             print(f"  [MONITOR] Post-run taskkill {proc_name} BŁĄD: {e}", flush=True)
 
 
+def _kill_process_tree(pid: int) -> None:
+    """Zabija proces `pid` wraz z całym drzewem potomków (taskkill /T)."""
+    if sys.platform != "win32":
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as e:
+        print(f"  [MONITOR] kill_process_tree({pid}) BŁĄD: {e}", flush=True)
+
+
+# Co ile sekund (zegara ściennego) watchdog sprawdza, czy subprocess nie przekroczył
+# limitu czasu. Krótkie okno = szybka reakcja po wybudzeniu z Modern Standby.
+WATCHDOG_POLL_SECONDS = 30
+
+
 def _run_scraper_subprocess(scraper_name: str) -> dict:
     """
     Uruchamia scraper jako osobny proces (fault isolation).
@@ -604,25 +623,46 @@ def _run_scraper_subprocess(scraper_name: str) -> dict:
         "timestamp": datetime.now().isoformat(),
     }
 
+    # WALL-CLOCK WATCHDOG (incydent 2026-06-10):
+    # subprocess.run(timeout=) opiera się na time.monotonic(), który ZAMARZA podczas
+    # Modern Standby / hibernacji. Przy uśpionym laptopie 240-min timeout Pracuj nigdy
+    # nie wybijał → monitor wisiał tu w nieskończoność i NIGDY nie wysyłał raportu
+    # (mail START był, FINISH nie). datetime.now() to zegar ścienny — po wybudzeniu
+    # odzwierciedla realny czas, więc watchdog wykryje przekroczenie i ubije drzewo.
+    deadline = datetime.now() + timedelta(seconds=config["timeout"])
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             config["cmd"],
             cwd=str(PROJECT_DIR),
             env=env,
-            timeout=config["timeout"],
             # stdout/stderr idą bezpośrednio do naszego stdout (= do pliku logu bat'a)
         )
 
-        if proc.returncode != 0:
-            fail_result["errors"].append(
-                f"Proces zakończył się kodem {proc.returncode}"
-            )
+        returncode = None
+        while True:
+            try:
+                returncode = proc.wait(timeout=WATCHDOG_POLL_SECONDS)
+                break  # proces sam się zakończył
+            except subprocess.TimeoutExpired:
+                if datetime.now() >= deadline:
+                    print(f"\n[MONITOR] WALL-TIMEOUT: {scraper_name} przekroczył "
+                          f"{config['timeout']}s zegara ściennego — zabijam drzewo procesów.",
+                          flush=True)
+                    _kill_process_tree(proc.pid)
+                    try:
+                        proc.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    fail_result["errors"].append(
+                        f"Wall-clock timeout po {config['timeout']}s (proces zabity)"
+                    )
+                    break
+                # jeszcze w limicie — śpij dalej (po wybudzeniu kolejny obrót wykryje overrun)
 
-    except subprocess.TimeoutExpired:
-        print(f"\n[MONITOR] TIMEOUT: {scraper_name} przekroczył {config['timeout']}s!", flush=True)
-        fail_result["errors"].append(
-            f"Timeout po {config['timeout']}s"
-        )
+        if returncode is not None and returncode != 0 and not fail_result["errors"]:
+            fail_result["errors"].append(
+                f"Proces zakończył się kodem {returncode}"
+            )
 
     except Exception as e:
         print(f"\n[MONITOR] Błąd uruchamiania {scraper_name}: {e}", flush=True)
