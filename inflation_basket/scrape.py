@@ -234,6 +234,20 @@ _AUCHAN_SIZE_RE = re.compile(
     r'data-test="fop-size"[^>]*>([^<]+)<', re.IGNORECASE
 )
 
+# ── PDP (product page) fallback markers ───────────────────────────────
+# The search SSR cards expose fop-* markers; the direct product page does
+# NOT. Instead it embeds schema.org JSON-LD (most stable) plus a state JSON
+# blob. We anchor on priceCurrency to avoid matching unrelated "price" keys.
+_AUCHAN_PDP_PRICE_RE = re.compile(
+    r'"price"\s*:\s*"([\d.]+)"\s*,\s*"priceCurrency"\s*:\s*"PLN"'
+)
+# state JSON: "unit":{"label":"fop.price.per.kg","current":{"amount":"22.93"
+_AUCHAN_PDP_UNIT_RE = re.compile(
+    r'"unit"\s*:\s*\{\s*"label"\s*:\s*"fop\.price\.per\.(\w+)"\s*,\s*'
+    r'"current"\s*:\s*\{\s*"amount"\s*:\s*"([\d.]+)"',
+    re.IGNORECASE,
+)
+
 
 def _auchan_to_float(s: str) -> Optional[float]:
     s = s.replace("\xa0", "").replace(" ", "").replace(",", ".").strip()
@@ -336,6 +350,47 @@ def _auchan_extract_card(html: str, retailer_product_id: str) -> Optional[str]:
     return html[start : start + 5000]
 
 
+def _auchan_pdp_html(page, url: str) -> str:
+    """Fetch the direct product page HTML (fallback path)."""
+    resp = page.request.get(url, headers={"Accept": "text/html"}, timeout=25000)
+    if resp.status != 200:
+        raise RuntimeError(f"Auchan PDP HTTP {resp.status}")
+    return resp.text()
+
+
+def _auchan_parse_pdp(html: str) -> Optional[dict]:
+    """Parse price from a direct product-page (PDP) HTML.
+
+    Fallback for when search-card matching fails (the search SSR window is
+    ranking-dependent and intermittently omits a product). The PDP carries
+    schema.org JSON-LD, which is far more stable than search markers.
+
+    Limitation: JSON-LD `price` is the current *selling* price. If the item
+    is on promo, this returns the promo price as `regular` and cannot flag
+    the promo (the PDP has no fop-reference-price equivalent we rely on).
+    A present-but-promo-unaware observation still beats a missing data point.
+    """
+    pm = _AUCHAN_PDP_PRICE_RE.search(html)
+    if not pm:
+        return None
+    regular = _auchan_to_float(pm.group(1))
+    if regular is None:
+        return None
+
+    unit_price = None
+    um = _AUCHAN_PDP_UNIT_RE.search(html)
+    if um:
+        kind = um.group(1).lower()
+        amt = _auchan_to_float(um.group(2))
+        if amt is not None:
+            if kind in ("kg", "l"):
+                unit_price = round(amt / 10.0, 4)  # zł/kg → zł/100g (zł/l → zł/100ml)
+            else:  # szt, opak, ml, g, piece
+                unit_price = round(amt, 4)
+
+    return {"regular": regular, "promo": None, "promo_active": False, "unit_price": unit_price}
+
+
 def _scrape_auchan(products: list[dict]) -> tuple[list[dict], list[tuple]]:
     rows: list[dict] = []
     errors: list[tuple] = []
@@ -389,13 +444,26 @@ def _scrape_auchan(products: list[dict]) -> tuple[list[dict], list[tuple]]:
                         break
                     time.sleep(0.4)
 
-                if chunk is None:
-                    errors.append((p["product_id"], name, "card not found by rid"))
-                    continue
+                parsed = _auchan_parse_price(chunk) if chunk is not None else None
 
-                parsed = _auchan_parse_price(chunk)
+                # Fallback: search ranking is flaky — the card sometimes isn't
+                # in the returned SSR window. Hit the product page directly and
+                # parse its schema.org JSON-LD instead of giving up.
                 if parsed is None:
-                    errors.append((p["product_id"], name, "price not found"))
+                    try:
+                        pdp_html = _auchan_pdp_html(page, p.get("url", ""))
+                        parsed = _auchan_parse_pdp(pdp_html)
+                        if parsed is not None:
+                            print(f"  [pdp-fallback] id={p['product_id']} {name}: "
+                                  f"regular={parsed['regular']}")
+                    except Exception as e:
+                        errors.append((p["product_id"], name,
+                                       f"pdp fallback failed: {str(e)[:80]}"))
+                        continue
+
+                if parsed is None:
+                    reason = "card not found by rid" if chunk is None else "price not found"
+                    errors.append((p["product_id"], name, f"{reason} (+pdp empty)"))
                     continue
 
                 rows.append({
@@ -437,6 +505,14 @@ def scrape_store(store: str) -> dict:
         rows, errors = _scrape_auchan(products)
     else:
         return {"store": store, "error": f"unsupported store {store}"}
+
+    # Log every per-product error so the real reason survives in the run log.
+    # The email keeps only error_samples[:5] and the LLM verdict can invent
+    # causes — without this, a failed product is invisible after the fact.
+    if errors:
+        print(f"[{store}] {len(errors)} product/run errors:")
+        for err in errors:
+            print(f"    - {err}")
 
     saved = 0
     if rows:
